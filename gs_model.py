@@ -11,37 +11,32 @@
 
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
 import json
-from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
-from simple_knn._C import distCUDA2
-from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
+from pypose import SO3
+from scipy.spatial import KDTree
+import torch
+from sh_rgb import RGB2SH
+
+
+def build_scaling_rotation(s, R):
+    S = torch.diag_embed(s)  
+    L = R @ L 
+    return L
+
+def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
+    '''Cov = L @ L^T = R @ S @ S^T @ R^T
+    '''
+    L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+    covariance = L @ L.transpose(1, 2)
+    return covariance
+
+def inverse_sigmoid(x):
+    return torch.log(x/(1-x))
 
 class GaussianModel:
-
-    def setup_functions(self):
-        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
-            L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-            actual_covariance = L @ L.transpose(1, 2)
-            symm = strip_symmetric(actual_covariance)
-            return symm
-        
-        self.scaling_activation = torch.exp
-        self.scaling_inverse_activation = torch.log
-
-        self.covariance_activation = build_covariance_from_scaling_rotation
-
-        self.opacity_activation = torch.sigmoid
-        self.inverse_opacity_activation = inverse_sigmoid
-
-        self.rotation_activation = torch.nn.functional.normalize
-
-
     def __init__(self, sh_degree, optimizer_type="default"):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
@@ -58,7 +53,16 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        self.setup_functions()
+
+        self.scaling_activation = torch.exp
+        self.scaling_inverse_activation = torch.log
+
+        self.covariance_activation = build_covariance_from_scaling_rotation
+
+        self.opacity_activation = torch.sigmoid
+        self.inverse_opacity_activation = inverse_sigmoid
+
+        self.rotation_activation = torch.nn.functional.normalize
 
     def capture(self):
         return (
@@ -141,7 +145,13 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
+    def dist_kdtree(self, points_np):
+        dists, inds = KDTree(points_np).query(points_np, k=4)
+        meanDists = (dists[:, 1:] ** 2).mean(1)
+
+        return torch.from_numpy(meanDists)
+
+    def create_from_pcd(self, pcd, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
@@ -151,7 +161,7 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(self.dist_kdtree(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
@@ -184,26 +194,18 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
-        if self.optimizer_type == "default":
-            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        elif self.optimizer_type == "sparse_adam":
-            try:
-                self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
-            except:
-                # A special version of the rasterizer is required to enable sparse adam
-                self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
-        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
-                                                    lr_delay_mult=training_args.position_lr_delay_mult,
-                                                    max_steps=training_args.position_lr_max_steps)
+        # self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
+        #                                             lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+        #                                             lr_delay_mult=training_args.position_lr_delay_mult,
+        #                                             max_steps=training_args.position_lr_max_steps)
         
-        self.exposure_scheduler_args = get_expon_lr_func(training_args.exposure_lr_init, training_args.exposure_lr_final,
-                                                        lr_delay_steps=training_args.exposure_lr_delay_steps,
-                                                        lr_delay_mult=training_args.exposure_lr_delay_mult,
-                                                        max_steps=training_args.iterations)
+        # self.exposure_scheduler_args = get_expon_lr_func(training_args.exposure_lr_init, training_args.exposure_lr_final,
+        #                                                 lr_delay_steps=training_args.exposure_lr_delay_steps,
+        #                                                 lr_delay_mult=training_args.exposure_lr_delay_mult,
+        #                                                 max_steps=training_args.iterations)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -232,7 +234,8 @@ class GaussianModel:
         return l
 
     def save_ply(self, path):
-        mkdir_p(os.path.dirname(path))
+        if not os.path.exists(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
@@ -413,7 +416,7 @@ class GaussianModel:
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        rots = self._rotation[selected_pts_mask].repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
