@@ -1,0 +1,13 @@
+./data/*
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info
+*.dist-info
+*.whl
+*.db
+*.sqlite3

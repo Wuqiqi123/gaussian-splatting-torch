@@ -37,9 +37,8 @@ def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
 class GaussianModel:
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree=3):
         self.active_sh_degree = 0
-        self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
@@ -161,7 +160,7 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(self.dist_kdtree(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(self.dist_kdtree(np.asarray(pcd.points)).float().cuda(), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
