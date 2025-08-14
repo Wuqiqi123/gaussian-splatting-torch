@@ -19,3 +19,4 @@ dependencies:
       - einops==0.8.1
       - plyfile
       - pypose
+      - trimesh
