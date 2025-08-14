@@ -106,7 +106,7 @@ def add_scene_cam(scene, pose_c2w, edge_color, image=None, focal=None, imsize=No
         focal = min(H,W) * 1.1 # default value
 
     # create fake camera
-    height = max(screen_width/10, focal * screen_width / H )
+    height = max(screen_width / 2, focal * screen_width / H )
     width = screen_width * 0.5**0.5
     rot45 = np.eye(4)
     rot45[:3, :3] = Rotation.from_euler('z', np.deg2rad(45)).as_matrix()
