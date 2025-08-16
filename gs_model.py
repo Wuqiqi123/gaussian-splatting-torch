@@ -19,6 +19,7 @@ from pypose import SO3
 from scipy.spatial import KDTree
 import torch
 from sh_rgb import RGB2SH
+from colmap_reader import SceneInfo
 
 
 def build_scaling_rotation(s, R):
@@ -35,6 +36,7 @@ def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
+
 
 class GaussianModel:
     def __init__(self, sh_degree=3):
@@ -150,17 +152,17 @@ class GaussianModel:
 
         return torch.from_numpy(meanDists)
 
-    def create_from_pcd(self, pcd, cam_infos : int, spatial_lr_scale : float):
+    def create_from_pcd(self, scene: SceneInfo, spatial_lr_scale = 0.1):
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        fused_point_cloud = torch.tensor(np.asarray(scene.point_cloud.points)).float().cuda()
+        fused_color = RGB2SH(torch.tensor(np.asarray(scene.point_cloud.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(self.dist_kdtree(np.asarray(pcd.points)).float().cuda(), 0.0000001)
+        dist2 = torch.clamp_min(self.dist_kdtree(np.asarray(scene.point_cloud.points)).float().cuda(), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
@@ -174,9 +176,9 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
+        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(scene.cameras)}
         self.pretrained_exposures = None
-        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
+        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(scene.cameras), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
     def training_setup(self, training_args):

@@ -146,8 +146,7 @@ def read_intrinsics_binary(path_to_model_file):
 
 class CameraInfo(NamedTuple):
     uid: int
-    R: np.array
-    T: np.array
+    tf_world_cam: np.array  # 4x4 transformation matrix
     FovY: np.array
     FovX: np.array
     image_path: str
@@ -170,8 +169,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         width = intr.width
 
         uid = intr.id
-        R = np.transpose(qvec2rotmat(extr.qvec))
-        T = np.array(extr.tvec)
+
+        tf_world_cam = np.eye(4)
+        tf_world_cam[:3, :3] = extr.qvec2rotmat()
+        tf_world_cam[:3, 3] = extr.tvec
+
 
         if intr.model=="SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
@@ -189,7 +191,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_name = extr.name
         image = PIL.Image.open(image_path)
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX,
+        cam_info = CameraInfo(uid=uid, tf_world_cam=tf_world_cam, FovY=FovY, FovX=FovX,
                               image_path=image_path, image_name=image_name,
                               image=np.array(image),
                               width=width, height=height)
@@ -258,7 +260,29 @@ class SceneInfo:
     point_cloud: BasicPointCloud
     cameras: list[CameraInfo]
     ply_path: str
+    nerf_normalization: dict
 
+
+def getNerfppNorm(cam_info : CameraInfo):
+    def get_center_and_diag(cam_centers):
+        cam_centers = np.hstack(cam_centers)
+        avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
+        center = avg_cam_center
+        dist = np.linalg.norm(cam_centers - center, axis=0, keepdims=True)
+        diagonal = np.max(dist)
+        return center.flatten(), diagonal
+
+    cam_centers = []
+
+    for cam in cam_info:
+        cam_centers.append(cam.tf_world_cam[:3, 3:4])
+
+    center, diagonal = get_center_and_diag(cam_centers)
+    radius = diagonal * 1.1
+
+    translate = -center
+
+    return {"translate": translate, "radius": radius}
 
 def fetchPly(path):
     plydata = PlyData.read(path)
@@ -283,12 +307,15 @@ def read_colmap_scene_info(path):
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     xyz, rgb, _ = read_points3D_binary(bin_path)
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
+
+    nerf_normalization = getNerfppNorm(cam_infos)
         
     storePly(ply_path, xyz, rgb)
     pcd = fetchPly(ply_path)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            cameras=cam_infos,
-                           ply_path=ply_path)
+                           ply_path=ply_path, 
+                            nerf_normalization=nerf_normalization)
     return scene_info
 

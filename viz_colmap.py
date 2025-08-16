@@ -169,11 +169,8 @@ def create_visual_scene(scene_info: SceneInfo, point_size=0.01, cam_size=0.1):
 
     # Add cameras to the scene
     for i, cam in enumerate(scene_info.cameras):
-        pose_c2w = np.eye(4, dtype=np.float32)
-        pose_c2w[:3, :3] = cam.R
-        pose_c2w[:3, 3] = cam.T
         edge_color = CAM_COLORS[i % len(CAM_COLORS)]
-        add_scene_cam(scene, pose_c2w, edge_color, image=None,
+        add_scene_cam(scene, cam.tf_world_cam, edge_color, image=None,
                       focal=cam.FovX, imsize=(cam.width, cam.height),
                       screen_width=cam_size)
 
