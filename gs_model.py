@@ -13,13 +13,11 @@ import torch
 import numpy as np
 from torch import nn
 import os
-import json
-from plyfile import PlyData, PlyElement
 from pypose import SO3
 from scipy.spatial import KDTree
 import torch
 from sh_rgb import RGB2SH
-from colmap_reader import SceneInfo, CameraInfo
+from colmap_reader import SceneInfo
 from pypose import SE3
 import math
 
@@ -40,36 +38,50 @@ def inverse_sigmoid(x):
 
 
 class GaussianModel(nn.Module):
-    def __init__(self, sh_degree=3):
+    def __init__(self, scene: SceneInfo,  sh_degree=3):
         super(GaussianModel, self).__init__()
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
-        self._xyz = torch.empty(0)
-        self._features_dc = torch.empty(0)
-        self._features_rest = torch.empty(0)
-        self._scaling = torch.empty(0)
-        self._rotation = torch.empty(0)
-        self._opacity = torch.empty(0)
-        self.max_radii2D = torch.empty(0)
-        self.xyz_gradient_accum = torch.empty(0)
-        self.denom = torch.empty(0)
-        self.optimizer = None
         self.percent_dense = 0
-        self.spatial_lr_scale = 0
 
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
-
         self.covariance_activation = build_covariance_from_scaling_rotation
-
-        self.opacity_activation = torch.sigmoid
-        self.inverse_opacity_activation = inverse_sigmoid
-
+        self.opacity_activation = torch.sigmoid 
+        self.inverse_opacity_activation = inverse_sigmoid ## (0, 1) -> (-inf, +inf)
         self.rotation_activation = torch.nn.functional.normalize
+
+
+        self.spatial_lr_scale = scene.nerf_normalization["radius"]
+        fused_point_cloud = torch.tensor(scene.point_cloud.points).float()
+        fused_color = RGB2SH(torch.tensor(scene.point_cloud.colors).float())
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float()
+        features[:, :3, 0 ] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+
+        dist2 = torch.clamp_min(self.dist_kdtree(scene.point_cloud.points).float().cuda(), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4))
+        rots[:, 0] = 1
+
+        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float))
+        self.xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self.features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self.features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self.scaling = nn.Parameter(scales.requires_grad_(True))
+        self.rotation = nn.Parameter(rots.requires_grad_(True))
+        self.opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self._xyz.shape[0]))
+        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(scene.cameras)}
+        self.pretrained_exposures = None
+        exposure = torch.eye(3, 4)[None].repeat(len(scene.cameras), 1, 1)
+        self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
     @property
     def get_scaling(self):
-        return self.scaling_activation(self._scaling)
+        return self.scaling_activation(self.scaling)
     
     @property
     def get_rotation(self):
@@ -105,33 +117,6 @@ class GaussianModel(nn.Module):
 
         return torch.from_numpy(meanDists)
 
-    def create_from_pcd(self, scene: SceneInfo):
-        self.spatial_lr_scale = scene.nerf_normalization["radius"]
-        fused_point_cloud = torch.tensor(scene.point_cloud.points).float()
-        fused_color = RGB2SH(torch.tensor(scene.point_cloud.colors).float())
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float()
-        features[:, :3, 0 ] = fused_color
-        features[:, 3:, 1:] = 0.0
-
-        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
-
-        dist2 = torch.clamp_min(self.dist_kdtree(scene.point_cloud.points).float().cuda(), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4))
-        rots[:, 0] = 1
-
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float))
-        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._scaling = nn.Parameter(scales.requires_grad_(True))
-        self._rotation = nn.Parameter(rots.requires_grad_(True))
-        self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self.max_radii2D = torch.zeros((self._xyz.shape[0]))
-        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(scene.cameras)}
-        self.pretrained_exposures = None
-        exposure = torch.eye(3, 4)[None].repeat(len(scene.cameras), 1, 1)
-        self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
