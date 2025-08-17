@@ -2,6 +2,7 @@ from gs_model import GaussianModel
 import os
 from colmap_reader import read_colmap_scene_info
 from viz_colmap import create_visual_scene
+from render import Render
 
 import trimesh
 
@@ -15,4 +16,6 @@ scene = read_colmap_scene_info("data/playroom")
 
 model.create_from_pcd(scene)
 
-print("Number of Gaussians: ", model.get_xyz.shape[0])
+renderer = Render(scene.cameras)
+
+print("Number of Gaussians: ", model._xyz.shape[0])

@@ -39,52 +39,9 @@ def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
 
-class Cameras(nn.Module):
-    def __init__(self, camera_infos: list[CameraInfo]):
-        super(Cameras, self).__init__()
-        self.uids = torch.stack([torch.tensor(cam_info.uid) for cam_info in camera_infos], dim=0)
-        self.tf_world_cams = SE3(torch.stack([torch.tensor(cam_info.tf_world_cam) for cam_info in camera_infos], dim=0))
-        self.fovs = torch.stack([torch.tensor(cam_info.fov) for cam_info in camera_infos], dim=0)
-        self.image_names = torch.stack([torch.tensor(cam_info.image_name) for cam_info in camera_infos], dim=0)
-        self.gt_images = torch.stack([torch.tensor(cam_info.image) for cam_info in camera_infos], dim=0)
-
-        self.zfar = 100.0
-        self.znear = 0.01
-
-        self.tf_cams_world = self.tf_world_cams.inverse()
-        self.projection_matrix = self.get_projection_matrix(znear=self.znear, zfar=self.zfar, fov=self.fovs)
-        self.full_proj_transform = self.projection_matrix @ self.tf_cams_world.matrix
-
-    def get_projection_matrix(self, znear, zfar, fovs):
-        fovY = fovs[:, 0]
-        fovX = fovs[:, 1]
-        tanHalfFovY = np.tan((fovY / 2))
-        tanHalfFovX = np.tan((fovX / 2))
-
-        top = tanHalfFovY * znear
-        bottom = -top
-        right = tanHalfFovX * znear
-        left = -right
-
-        P = torch.zeros((fovs.shape[0], 4, 4))
-
-        z_sign = 1.0
-
-        P[..., 0, 0] = 2.0 * znear / (right - left)
-        P[..., 1, 1] = 2.0 * znear / (top - bottom)
-        P[..., 0, 2] = (right + left) / (right - left)
-        P[..., 1, 2] = (top + bottom) / (top - bottom)
-        P[..., 3, 2] = z_sign
-        P[..., 2, 2] = z_sign * zfar / (zfar - znear)
-        P[..., 2, 3] = -(zfar * znear) / (zfar - znear)
-        return P
-
-    def forward(self, points):
-        pass
-
-
 class GaussianModel(nn.Module):
     def __init__(self, sh_degree=3):
+        super(GaussianModel, self).__init__()
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
@@ -110,40 +67,6 @@ class GaussianModel(nn.Module):
 
         self.rotation_activation = torch.nn.functional.normalize
 
-    def capture(self):
-        return (
-            self.active_sh_degree,
-            self._xyz,
-            self._features_dc,
-            self._features_rest,
-            self._scaling,
-            self._rotation,
-            self._opacity,
-            self.max_radii2D,
-            self.xyz_gradient_accum,
-            self.denom,
-            self.optimizer.state_dict(),
-            self.spatial_lr_scale,
-        )
-    
-    def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
-        self.training_setup(training_args)
-        self.xyz_gradient_accum = xyz_gradient_accum
-        self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
-
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
@@ -153,30 +76,15 @@ class GaussianModel(nn.Module):
         return self.rotation_activation(self._rotation)
     
     @property
-    def get_xyz(self):
-        return self._xyz
-    
-    @property
     def get_features(self):
         features_dc = self._features_dc
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
     
-    @property
-    def get_features_dc(self):
-        return self._features_dc
-    
-    @property
-    def get_features_rest(self):
-        return self._features_rest
-    
+
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-    
-    @property
-    def get_exposure(self):
-        return self._exposure
 
     def get_exposure_from_name(self, image_name):
         if self.pretrained_exposures is None:
@@ -199,9 +107,9 @@ class GaussianModel(nn.Module):
 
     def create_from_pcd(self, scene: SceneInfo):
         self.spatial_lr_scale = scene.nerf_normalization["radius"]
-        fused_point_cloud = torch.tensor(scene.point_cloud.points).float().cuda()
-        fused_color = RGB2SH(torch.tensor(scene.point_cloud.colors).float().cuda())
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        fused_point_cloud = torch.tensor(scene.point_cloud.points).float()
+        fused_color = RGB2SH(torch.tensor(scene.point_cloud.colors).float())
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
 
@@ -209,27 +117,26 @@ class GaussianModel(nn.Module):
 
         dist2 = torch.clamp_min(self.dist_kdtree(scene.point_cloud.points).float().cuda(), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots = torch.zeros((fused_point_cloud.shape[0], 4))
         rots[:, 0] = 1
 
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
-
+        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float))
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.max_radii2D = torch.zeros((self._xyz.shape[0]))
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(scene.cameras)}
         self.pretrained_exposures = None
-        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(scene.cameras), 1, 1)
+        exposure = torch.eye(3, 4)[None].repeat(len(scene.cameras), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1))
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1))
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
