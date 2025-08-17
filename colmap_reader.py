@@ -147,8 +147,7 @@ def read_intrinsics_binary(path_to_model_file):
 class CameraInfo(NamedTuple):
     uid: int
     tf_world_cam: np.array  # 4x4 transformation matrix
-    FovY: np.array
-    FovX: np.array
+    fov: np.array
     image_path: str
     image_name: str
     image: np.array
@@ -187,11 +186,13 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
+        fov = np.array([FovX, FovY])
+
         image_path = os.path.join(images_folder, extr.name)
         image_name = extr.name
         image = PIL.Image.open(image_path)
 
-        cam_info = CameraInfo(uid=uid, tf_world_cam=tf_world_cam, FovY=FovY, FovX=FovX,
+        cam_info = CameraInfo(uid=uid, tf_world_cam=tf_world_cam, fov=fov,
                               image_path=image_path, image_name=image_name,
                               image=np.array(image),
                               width=width, height=height)
