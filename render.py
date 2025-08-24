@@ -26,14 +26,11 @@ class Render(nn.Module):
         self.full_proj_transform = self.projection_matrix @ self.tf_cams_world.matrix()
 
     def get_projection_matrix(self, znear, zfar, fovs):
-        fovY = fovs[:, 0]
-        fovX = fovs[:, 1]
-        tanHalfFovY = np.tan(fovY / 2)
-        tanHalfFovX = np.tan(fovX / 2)
+        tan_half_fov = torch.tan(fovs / 2)
 
-        top = tanHalfFovY * znear
+        top = tan_half_fov[:, 1] * znear
         bottom = -top
-        right = tanHalfFovX * znear
+        right = tan_half_fov[:, 0] * znear
         left = -right
 
         P = torch.zeros((fovs.shape[0], 4, 4))
