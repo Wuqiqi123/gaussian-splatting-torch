@@ -22,7 +22,7 @@ import math
 
 def build_scaling_rotation(s, R):
     S = torch.diag_embed(s)  
-    L = R @ L 
+    L = R.matrix() @ S 
     return L
 
 def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
@@ -72,7 +72,7 @@ class GaussianModel(nn.Module):
 
     @property
     def scaling(self):
-        return torch.exp(self.scaling_logit)
+        return torch.exp(self.scaling_logits)
     
 
     @property
@@ -92,7 +92,7 @@ class GaussianModel(nn.Module):
         else:
             return self.pretrained_exposures[image_name]
     
-    def covariance(self, scaling_modifier = 1):
+    def get_covariance(self, scaling_modifier = 1.0):
         return build_covariance_from_scaling_rotation(self.scaling, scaling_modifier, self.rotation)
 
     def oneupSHdegree(self):
@@ -365,5 +365,3 @@ if __name__ == "__main__":
     scene = read_colmap_scene_info("data/playroom")
 
     model = GaussianModel(scene)
-
-    print("11")

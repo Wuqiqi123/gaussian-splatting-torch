@@ -171,7 +171,7 @@ def create_visual_scene(scene_info: SceneInfo, point_size=0.01, cam_size=0.1):
     for i, cam in enumerate(scene_info.cameras):
         edge_color = CAM_COLORS[i % len(CAM_COLORS)]
         add_scene_cam(scene, cam.tf_world_cam, edge_color, image=None,
-                      focal=cam.FovX, imsize=(cam.width, cam.height),
+                      focal=cam.focal, imsize=(cam.width, cam.height),
                       screen_width=cam_size)
 
     return scene

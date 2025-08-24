@@ -153,6 +153,7 @@ class CameraInfo(NamedTuple):
     image: np.array
     width: int
     height: int
+    focal: np.array
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     cam_infos = []
@@ -188,6 +189,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         fov = np.array([FovX, FovY])
 
+        focal = np.array([focal_length_x, focal_length_y])
+
         image_path = os.path.join(images_folder, extr.name)
         image_name = extr.name
         image = PIL.Image.open(image_path)
@@ -195,7 +198,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         cam_info = CameraInfo(uid=uid, tf_world_cam=tf_world_cam, fov=fov,
                               image_path=image_path, image_name=image_name,
                               image=np.array(image),
-                              width=width, height=height)
+                              width=width, height=height, focal=focal)
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
@@ -317,6 +320,6 @@ def read_colmap_scene_info(path):
     scene_info = SceneInfo(point_cloud=pcd,
                            cameras=cam_infos,
                            ply_path=ply_path, 
-                            nerf_normalization=nerf_normalization)
+                           nerf_normalization=nerf_normalization)
     return scene_info
 
