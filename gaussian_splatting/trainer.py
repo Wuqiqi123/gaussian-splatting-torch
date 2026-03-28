@@ -78,7 +78,7 @@ class Trainer(object):
         
         if self.accelerator.is_main_process:
             self.results_folder = Path(results_folder)
-            self.results_folder.mkdir(exist_ok = True)
+            self.results_folder.mkdir(parents=True, exist_ok=True)
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
@@ -175,6 +175,8 @@ class Trainer(object):
                         self.save(milestone)
                 
                 pbar.update(1)
+
+        self.save('final')
 
         if self.with_tracking:
             accelerator.end_training()

@@ -1,4 +1,3 @@
-import pdb
 import torch
 import torch.nn as nn
 import math
@@ -20,7 +19,7 @@ def build_rotation(r):
 
     q = r / norm[:, None]
 
-    R = torch.zeros((q.size(0), 3, 3), device='cuda')
+    R = torch.zeros((q.size(0), 3, 3), device=r.device)
 
     r = q[:, 0]
     x = q[:, 1]
@@ -41,7 +40,7 @@ def build_rotation(r):
 
 
 def build_scaling_rotation(s, r):
-    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")
+    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device=s.device)
     R = build_rotation(r)
 
     L[:,0,0] = s[:,0]
@@ -53,7 +52,7 @@ def build_scaling_rotation(s, r):
 
 
 def strip_lowerdiag(L):
-    uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="cuda")
+    uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device=L.device)
     uncertainty[:, 0] = L[:, 0, 0]
     uncertainty[:, 1] = L[:, 0, 1]
     uncertainty[:, 2] = L[:, 0, 2]
@@ -160,7 +159,6 @@ class GaussRenderer(nn.Module):
         self.active_sh_degree = active_sh_degree
         self.debug = False
         self.white_bkgd = white_bkgd
-        self.pix_coord = torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256), indexing='xy'), dim=-1).to('cuda')
         
     
     def build_color(self, means3D, shs, camera):
@@ -173,104 +171,115 @@ class GaussRenderer(nn.Module):
     def render(self, camera, means2D, cov2d, color, opacity, depths):
         radii = get_radius(cov2d)
         rect = get_rect(means2D, radii, width=camera.image_width, height=camera.image_height)
-        
-        self.render_color = torch.ones(*self.pix_coord.shape[:2], 3).to('cuda')
-        self.render_depth = torch.zeros(*self.pix_coord.shape[:2], 1).to('cuda')
-        self.render_alpha = torch.zeros(*self.pix_coord.shape[:2], 1).to('cuda')
+
+        device = means2D.device
+        H, W = camera.image_height, camera.image_width
+        # pixel coordinate grid: pix_coord[i,j] = [x=j, y=i]
+        pix_coord = torch.stack(
+            torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy'),
+            dim=-1,
+        )  # H x W x 2
+
+        render_color = torch.ones(H, W, 3, device=device)
+        render_depth = torch.zeros(H, W, 1, device=device)
+        render_alpha = torch.zeros(H, W, 1, device=device)
 
         TILE_SIZE = 64
-        for h in range(0, camera.image_height, TILE_SIZE):
-            for w in range(0, camera.image_width, TILE_SIZE):
-                # check if the rectangle penetrate the tile
+        for h in range(0, H, TILE_SIZE):
+            for w in range(0, W, TILE_SIZE):
+                # check if any gaussian bounding rect overlaps this tile
                 over_tl = rect[0][..., 0].clip(min=w), rect[0][..., 1].clip(min=h)
                 over_br = rect[1][..., 0].clip(max=w+TILE_SIZE-1), rect[1][..., 1].clip(max=h+TILE_SIZE-1)
-                in_mask = (over_br[0] > over_tl[0]) & (over_br[1] > over_tl[1]) # 3D gaussian in the tile 
-                
+                in_mask = (over_br[0] > over_tl[0]) & (over_br[1] > over_tl[1])
+
                 if not in_mask.sum() > 0:
                     continue
 
-                P = in_mask.sum()
-                tile_coord = self.pix_coord[h:h+TILE_SIZE, w:w+TILE_SIZE].flatten(0,-2)
+                tile_h = min(TILE_SIZE, H - h)
+                tile_w = min(TILE_SIZE, W - w)
+                tile_coord = pix_coord[h:h+tile_h, w:w+tile_w].flatten(0, -2)  # (tile_h*tile_w, 2)
+
                 sorted_depths, index = torch.sort(depths[in_mask])
-                sorted_means2D = means2D[in_mask][index]
-                sorted_cov2d = cov2d[in_mask][index] # P 2 2
-                sorted_conic = sorted_cov2d.inverse() # inverse of variance
-                sorted_opacity = opacity[in_mask][index]
-                sorted_color = color[in_mask][index]
-                dx = (tile_coord[:,None,:] - sorted_means2D[None,:]) # B P 2
-                
+                sorted_means2D  = means2D[in_mask][index]
+                sorted_cov2d    = cov2d[in_mask][index]       # P 2 2
+                sorted_conic    = sorted_cov2d.inverse()       # inverse of covariance
+                sorted_opacity  = opacity[in_mask][index]
+                sorted_color    = color[in_mask][index]
+
+                dx = tile_coord[:, None, :] - sorted_means2D[None, :]  # (tile_pixels, P, 2)
+
                 gauss_weight = torch.exp(-0.5 * (
-                    dx[:, :, 0]**2 * sorted_conic[:, 0, 0] 
+                    dx[:, :, 0]**2 * sorted_conic[:, 0, 0]
                     + dx[:, :, 1]**2 * sorted_conic[:, 1, 1]
-                    + dx[:,:,0]*dx[:,:,1] * sorted_conic[:, 0, 1]
-                    + dx[:,:,0]*dx[:,:,1] * sorted_conic[:, 1, 0]))
-                
-                alpha = (gauss_weight[..., None] * sorted_opacity[None]).clip(max=0.99) # B P 1
-                T = torch.cat([torch.ones_like(alpha[:,:1]), 1-alpha[:,:-1]], dim=1).cumprod(dim=1)
+                    + dx[:, :, 0] * dx[:, :, 1] * sorted_conic[:, 0, 1]
+                    + dx[:, :, 0] * dx[:, :, 1] * sorted_conic[:, 1, 0]
+                ))
+
+                alpha     = (gauss_weight[..., None] * sorted_opacity[None]).clip(max=0.99)  # (pixels, P, 1)
+                T         = torch.cat([torch.ones_like(alpha[:, :1]), 1 - alpha[:, :-1]], dim=1).cumprod(dim=1)
                 acc_alpha = (alpha * T).sum(dim=1)
-                tile_color = (T * alpha * sorted_color[None]).sum(dim=1) + (1-acc_alpha) * (1 if self.white_bkgd else 0)
-                tile_depth = ((T * alpha) * sorted_depths[None,:,None]).sum(dim=1)
-                self.render_color[h:h+TILE_SIZE, w:w+TILE_SIZE] = tile_color.reshape(TILE_SIZE, TILE_SIZE, -1)
-                self.render_depth[h:h+TILE_SIZE, w:w+TILE_SIZE] = tile_depth.reshape(TILE_SIZE, TILE_SIZE, -1)
-                self.render_alpha[h:h+TILE_SIZE, w:w+TILE_SIZE] = acc_alpha.reshape(TILE_SIZE, TILE_SIZE, -1)
+                tile_color = (T * alpha * sorted_color[None]).sum(dim=1) + (1 - acc_alpha) * (1 if self.white_bkgd else 0)
+                tile_depth = ((T * alpha) * sorted_depths[None, :, None]).sum(dim=1)
+
+                render_color[h:h+tile_h, w:w+tile_w] = tile_color.reshape(tile_h, tile_w, -1)
+                render_depth[h:h+tile_h, w:w+tile_w] = tile_depth.reshape(tile_h, tile_w, -1)
+                render_alpha[h:h+tile_h, w:w+tile_w] = acc_alpha.reshape(tile_h, tile_w, -1)
 
         return {
-            "render": self.render_color,
-            "depth": self.render_depth,
-            "alpha": self.render_alpha,
-            "visiility_filter": radii > 0,
-            "radii": radii
+            "render": render_color,
+            "depth": render_depth,
+            "alpha": render_alpha,
+            "visibility_filter": radii > 0,
+            "radii": radii,
         }
 
 
     def forward(self, camera, pc, **kwargs):
-        means3D = pc.get_xyz
-        opacity = pc.get_opacity
-        scales = pc.get_scaling
+        means3D   = pc.get_xyz
+        opacity   = pc.get_opacity
+        scales    = pc.get_scaling
         rotations = pc.get_rotation
-        shs = pc.get_features
-        
-        if USE_PROFILE:
-            prof = profiler.record_function
-        else:
-            prof = contextlib.nullcontext
-            
-        with prof("projection"):
-            mean_ndc, mean_view, in_mask = projection_ndc(means3D, 
-                    viewmatrix=camera.world_view_transform, 
-                    projmatrix=camera.projection_matrix)
-            mean_ndc = mean_ndc[in_mask]
-            mean_view = mean_view[in_mask]
-            depths = mean_view[:,2]
-        
-        with prof("build color"):
-            color = self.build_color(means3D=means3D, shs=shs, camera=camera)
-        
-        with prof("build cov3d"):
-            cov3d = build_covariance_3d(scales, rotations)
-            
-        with prof("build cov2d"):
-            cov2d = build_covariance_2d(
-                mean3d=means3D, 
-                cov3d=cov3d, 
-                viewmatrix=camera.world_view_transform,
-                fov_x=camera.FoVx, 
-                fov_y=camera.FoVy, 
-                focal_x=camera.focal_x, 
-                focal_y=camera.focal_y)
+        shs       = pc.get_features
 
-            mean_coord_x = ((mean_ndc[..., 0] + 1) * camera.image_width - 1.0) * 0.5
-            mean_coord_y = ((mean_ndc[..., 1] + 1) * camera.image_height - 1.0) * 0.5
-            means2D = torch.stack([mean_coord_x, mean_coord_y], dim=-1)
-        
-        with prof("render"):
-            rets = self.render(
-                camera = camera, 
-                means2D=means2D,
-                cov2d=cov2d,
-                color=color,
-                opacity=opacity, 
-                depths=depths,
-            )
+        # --- projection & visibility filter ---
+        mean_ndc, mean_view, in_mask = projection_ndc(
+            means3D,
+            viewmatrix=camera.world_view_transform,
+            projmatrix=camera.projection_matrix,
+        )
+        mean_ndc  = mean_ndc[in_mask]
+        mean_view = mean_view[in_mask]
+        depths    = mean_view[:, 2]
 
-        return rets
+        # keep only visible gaussians for all subsequent ops
+        means3D_vis   = means3D[in_mask]
+        scales_vis    = scales[in_mask]
+        rotations_vis = rotations[in_mask]
+        shs_vis       = shs[in_mask]
+        opacity_vis   = opacity[in_mask]
+
+        color = self.build_color(means3D=means3D_vis, shs=shs_vis, camera=camera)
+
+        cov3d = build_covariance_3d(scales_vis, rotations_vis)
+        cov2d = build_covariance_2d(
+            mean3d=means3D_vis,
+            cov3d=cov3d,
+            viewmatrix=camera.world_view_transform,
+            fov_x=camera.FoVx,
+            fov_y=camera.FoVy,
+            focal_x=camera.focal_x,
+            focal_y=camera.focal_y,
+        )
+
+        mean_coord_x = ((mean_ndc[..., 0] + 1) * camera.image_width  - 1.0) * 0.5
+        mean_coord_y = ((mean_ndc[..., 1] + 1) * camera.image_height - 1.0) * 0.5
+        means2D = torch.stack([mean_coord_x, mean_coord_y], dim=-1)
+
+        return self.render(
+            camera=camera,
+            means2D=means2D,
+            cov2d=cov2d,
+            color=color,
+            opacity=opacity_vis,
+            depths=depths,
+        )

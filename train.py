@@ -94,12 +94,13 @@ if __name__ == "__main__":
         'white_bkgd': True,
     }
 
-    trainer = GSSTrainer(model=gaussModel, 
+    trainer = GSSTrainer(model=gaussModel,
         data=data,
-        train_batch_size=1, 
+        train_batch_size=1,
         train_num_steps=25000,
-        i_image =100,
-        train_lr=1e-3, 
+        i_image=100,
+        i_save=5000,
+        train_lr=1e-3,
         amp=False,
         fp16=False,
         results_folder='result/test',
