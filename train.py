@@ -5,17 +5,18 @@ from viz_colmap import create_visual_scene
 from render import Render
 
 import trimesh
+import torch
 
-model = GaussianModel()
 
 scene = read_colmap_scene_info("data/playroom")
+model = GaussianModel(scene)
 
-# trimesh_scene = create_visual_scene(scene)
+trimesh_scene = create_visual_scene(scene)
 # trimesh_scene.show()
 
 
-model.create_from_pcd(scene)
-
 renderer = Render(scene.cameras)
+
+renderer.forward(torch.tensor([0, 1, 3]), model)
 
 print("Number of Gaussians: ", model._xyz.shape[0])
