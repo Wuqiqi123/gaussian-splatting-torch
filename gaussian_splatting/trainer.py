@@ -74,7 +74,14 @@ class Trainer(object):
         self.with_tracking = with_tracking
         self.step = 0
 
-        self.opt = Adam(self.model.parameters(), lr=train_lr, betas=adam_betas)
+        # Support per-parameter-group learning rates (e.g. hash grid needs higher lr)
+        if hasattr(model, 'get_param_groups'):
+            opt_params = model.get_param_groups()
+            for g in opt_params:
+                g.setdefault('lr', train_lr)
+        else:
+            opt_params = model.parameters()
+        self.opt = Adam(opt_params, lr=train_lr, betas=adam_betas)
         
         if self.accelerator.is_main_process:
             self.results_folder = Path(results_folder)

@@ -140,11 +140,6 @@ def get_rect(pix_coord, radii, width, height):
     return rect_min, rect_max
 
 
-from .utils.sh_utils import eval_sh
-import torch.autograd.profiler as profiler
-USE_PROFILE = False
-import contextlib
-
 class GaussRenderer(nn.Module):
     """
     A gaussian splatting renderer
@@ -154,19 +149,13 @@ class GaussRenderer(nn.Module):
     >>> out = gaussRender(pc=gaussModel, camera=camera)
     """
 
-    def __init__(self, active_sh_degree=3, white_bkgd=True, **kwargs):
+    def __init__(self, white_bkgd=True, **kwargs):
         super(GaussRenderer, self).__init__()
-        self.active_sh_degree = active_sh_degree
-        self.debug = False
         self.white_bkgd = white_bkgd
-        
-    
-    def build_color(self, means3D, shs, camera):
-        rays_o = camera.camera_center
-        rays_d = means3D - rays_o
-        color = eval_sh(self.active_sh_degree, shs.permute(0,2,1), rays_d)
-        color = (color + 0.5).clip(min=0.0)
-        return color
+
+    def build_color(self, means3D, camera, pc):
+        rays_d = means3D - camera.camera_center
+        return pc.color_net(means3D, rays_d)
     
     def render(self, camera, means2D, cov2d, color, opacity, depths):
         radii = get_radius(cov2d)
@@ -239,7 +228,6 @@ class GaussRenderer(nn.Module):
         opacity   = pc.get_opacity
         scales    = pc.get_scaling
         rotations = pc.get_rotation
-        shs       = pc.get_features
 
         # --- projection & visibility filter ---
         mean_ndc, mean_view, in_mask = projection_ndc(
@@ -255,10 +243,9 @@ class GaussRenderer(nn.Module):
         means3D_vis   = means3D[in_mask]
         scales_vis    = scales[in_mask]
         rotations_vis = rotations[in_mask]
-        shs_vis       = shs[in_mask]
         opacity_vis   = opacity[in_mask]
 
-        color = self.build_color(means3D=means3D_vis, shs=shs_vis, camera=camera)
+        color = self.build_color(means3D=means3D_vis, camera=camera, pc=pc)
 
         cov3d = build_covariance_3d(scales_vis, rotations_vis)
         cov2d = build_covariance_2d(

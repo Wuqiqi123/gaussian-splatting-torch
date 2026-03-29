@@ -39,7 +39,7 @@ def render_to_image(ckpt_path, data_folder, output_path, camera_index=0, resize=
     print(f"Loaded checkpoint from step {step} — {model._xyz.shape[0]} Gaussians")
 
     # ── render ────────────────────────────────────────────────────────────────
-    renderer = GaussRenderer(active_sh_degree=model.max_sh_degree, white_bkgd=True)
+    renderer = GaussRenderer(white_bkgd=True)
     with torch.no_grad():
         out = renderer(pc=model, camera=camera)
 
