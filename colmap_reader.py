@@ -8,7 +8,7 @@ import collections
 import math
 from plyfile import PlyData, PlyElement
 from dataclasses import dataclass
-import PIL
+from PIL import Image as PILImage
 
 CameraModel = collections.namedtuple(
     "CameraModel", ["model_id", "model_name", "num_params"])
@@ -154,8 +154,9 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     focal: np.array
+    principal_point: np.array
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, image_scale=1):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -177,11 +178,14 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         if intr.model=="SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
+            focal_length_y = intr.params[0]
+            principal_point = intr.params[1:3]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model=="PINHOLE":
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
+            principal_point = intr.params[2:4]
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         else:
@@ -193,12 +197,23 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         image_path = os.path.join(images_folder, extr.name)
         image_name = extr.name
-        image = PIL.Image.open(image_path)
+        image = PILImage.open(image_path).convert("RGB")
+
+        if image_scale > 1:
+            resized_width = max(1, int(round(width / image_scale)))
+            resized_height = max(1, int(round(height / image_scale)))
+            image = image.resize((resized_width, resized_height), resample=PILImage.Resampling.BILINEAR)
+            focal = focal / image_scale
+            principal_point = principal_point / image_scale
+            width = resized_width
+            height = resized_height
+            fov = np.array([focal2fov(focal[0], width), focal2fov(focal[1], height)])
 
         cam_info = CameraInfo(uid=uid, tf_world_cam=tf_world_cam, fov=fov,
                               image_path=image_path, image_name=image_name,
-                              image=np.array(image),
-                              width=width, height=height, focal=focal)
+                              image=np.asarray(image).astype(np.float32) / 255.0,
+                              width=width, height=height, focal=focal,
+                              principal_point=principal_point.astype(np.float32))
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
@@ -297,7 +312,7 @@ def fetchPly(path):
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 
-def read_colmap_scene_info(path):
+def read_colmap_scene_info(path, image_scale=1):
     cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
     cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
     cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
@@ -305,7 +320,7 @@ def read_colmap_scene_info(path):
 
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics,
-        images_folder=os.path.join(path, "images"))
+        images_folder=os.path.join(path, "images"), image_scale=image_scale)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
@@ -322,4 +337,3 @@ def read_colmap_scene_info(path):
                            ply_path=ply_path, 
                            nerf_normalization=nerf_normalization)
     return scene_info
-
