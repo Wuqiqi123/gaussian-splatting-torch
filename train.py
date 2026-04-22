@@ -15,17 +15,24 @@ from render import Render, save_panel, split_indices
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train pure Torch Gaussian splats on a COLMAP scene")
+    parser = argparse.ArgumentParser(description="Train Gaussian splats on a COLMAP scene with diff-gaussian-rasterization")
     parser.add_argument("--data", type=str, default="data/playroom", help="COLMAP scene root")
     parser.add_argument("--output", type=str, default="outputs/playroom", help="Output directory")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
 
-    parser.add_argument("--iterations", type=int, default=3000)
-    parser.add_argument("--image-scale", type=int, default=8, help="Downsample factor for training images")
-    parser.add_argument("--max-points", type=int, default=6000, help="Limit initial COLMAP points for pure Torch training speed")
+    parser.add_argument("--iterations", type=int, default=10000)
+    parser.add_argument("--image-scale", type=int, default=1, help="Downsample factor for training images")
+    parser.add_argument("--max-points", type=int, default=13000, help="Limit initial COLMAP points for training speed")
     parser.add_argument("--holdout-every", type=int, default=8, help="Use every Nth image for validation")
     parser.add_argument("--white-background", action="store_true", help="Composite on white instead of black")
+    parser.add_argument(
+        "--render-mode",
+        type=str,
+        default="diff",
+        choices=["diff", "non_tile", "tile"],
+        help="Rasterizer backend. non_tile/tile are accepted as legacy aliases for the diff rasterizer.",
+    )
 
     parser.add_argument("--position-lr-init", type=float, default=1.6e-4)
     parser.add_argument("--feature-lr", type=float, default=2.5e-3)
@@ -35,7 +42,6 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--l1-weight", type=float, default=0.8)
     parser.add_argument("--dssim-weight", type=float, default=0.2)
-    parser.add_argument("--mse-weight", type=float, default=0.2)
     parser.add_argument("--opacity-reg", type=float, default=1.0e-4)
     parser.add_argument("--scale-reg", type=float, default=1.0e-4)
     parser.add_argument("--sh-degree", type=int, default=3)
@@ -45,6 +51,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--preview-index", type=int, default=0, help="Validation view index inside split list")
+
+    parser.add_argument("--densify-from", type=int, default=200)
+    parser.add_argument("--densify-until", type=int, default=2500)
+    parser.add_argument("--densify-interval", type=int, default=100)
+    parser.add_argument("--densify-grad-threshold", type=float, default=2e-4)
+    parser.add_argument("--densify-scale-threshold", type=float, default=0.01)
+    parser.add_argument("--prune-opacity-threshold", type=float, default=0.005)
+    parser.add_argument("--prune-screen-radius", type=float, default=64.0)
+    parser.add_argument("--world-prune-scale", type=float, default=1.0)
+    parser.add_argument("--max-gaussians", type=int, default=12000)
+    parser.add_argument("--split-factor", type=int, default=2)
+    parser.add_argument("--split-scale-factor", type=float, default=1.6)
+    parser.add_argument("--clone-jitter", type=float, default=0.35)
+    parser.add_argument("--opacity-reset-interval", type=int, default=3000)
+    parser.add_argument("--opacity-reset-max", type=float, default=0.01)
     return parser.parse_args()
 
 
@@ -98,7 +119,7 @@ def ssim(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) -> torch
     return ssim_map.mean()
 
 
-def evaluate(renderer: Render, model: GaussianModel, camera_ids: list[int], max_views: int = 4) -> dict:
+def evaluate(renderer: Render, model: GaussianModel, camera_ids: list[int], max_views: int = 4, render_mode: str = "non_tile") -> dict:
     if not camera_ids:
         return {"l1": 0.0, "mse": 0.0, "psnr": 0.0, "ssim": 0.0}
 
@@ -107,7 +128,7 @@ def evaluate(renderer: Render, model: GaussianModel, camera_ids: list[int], max_
     count = 0
     with torch.no_grad():
         for camera_idx in camera_ids[:max_views]:
-            result = renderer.render_camera(camera_idx, model)
+            result = renderer.render_camera(camera_idx, model, render_mode=render_mode)
             gt = renderer.get_ground_truth(camera_idx, device=model.xyz.device)
             l1 = F.l1_loss(result["rgb"], gt).item()
             mse = F.mse_loss(result["rgb"], gt).item()
@@ -132,6 +153,10 @@ def save_checkpoint(path: Path, model: GaussianModel, args: argparse.Namespace, 
     torch.save(payload, path)
 
 
+def rebuild_optimizer(model: GaussianModel, args: argparse.Namespace) -> torch.optim.Optimizer:
+    return model.training_setup(args)
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -152,7 +177,8 @@ def main() -> None:
         seed=args.seed,
     ).to(args.device)
     renderer = Render(scene.cameras, background_color=background)
-    optimizer = model.training_setup(args)
+    optimizer = rebuild_optimizer(model, args)
+    scene_extent = float(scene.nerf_normalization["radius"])
 
     train_ids, val_ids = split_indices(len(scene.cameras), args.holdout_every)
     preview_pool = val_ids if val_ids else train_ids
@@ -173,51 +199,103 @@ def main() -> None:
 
     best_val_psnr = float("-inf")
     for iteration in range(1, args.iterations + 1):
+        density_log = None
+        opacity_reset_done = False
         if args.sh_upgrade_every > 0 and iteration % args.sh_upgrade_every == 0:
             model.oneupSHdegree()
 
         camera_idx = random.choice(train_ids)
-        result = renderer.render_camera(camera_idx, model)
+        result = renderer.render_camera(camera_idx, model, render_mode=args.render_mode)
         gt = renderer.get_ground_truth(camera_idx, device=model.xyz.device)
 
         loss_l1 = F.l1_loss(result["rgb"], gt)
         loss_ssim = 1.0 - ssim(result["rgb"], gt)
-        loss_mse = F.mse_loss(result["rgb"], gt)
         loss = (
             args.l1_weight * loss_l1
             + args.dssim_weight * loss_ssim
-            + args.mse_weight * loss_mse
             + args.opacity_reg * model.opacity.mean()
             + args.scale_reg * model.scaling.mean()
         )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+
+        viewspace_points = result.get("viewspace_points")
+        if viewspace_points is not None and viewspace_points.grad is not None:
+            model.add_densification_stats(
+                viewspace_points_grad=viewspace_points.grad.detach(),
+                visible_indices=result["visible_indices"],
+                radii=result["radii"].detach(),
+            )
+        xyz_grad = model.xyz.grad.detach().clone() if model.xyz.grad is not None else torch.zeros_like(model.xyz)
         optimizer.step()
 
-        if iteration % args.log_every == 0 or iteration == 1:
-            psnr = mse_to_psnr(loss_mse.item())
-            print(
-                f"iter={iteration:05d} loss={loss.item():.6f} "
-                f"l1={loss_l1.item():.6f} dssim={loss_ssim.item():.6f} mse={loss_mse.item():.6f} "
-                f"psnr={psnr:.2f}dB sh={model.active_sh_degree}"
+        structure_changed = False
+        if (
+            args.densify_interval > 0
+            and args.densify_from <= iteration <= args.densify_until
+            and iteration % args.densify_interval == 0
+        ):
+            density_log = model.densify_and_prune(
+                xyz_grad=xyz_grad,
+                grad_threshold=args.densify_grad_threshold,
+                min_opacity=args.prune_opacity_threshold,
+                scene_extent=scene_extent,
+                scale_threshold=args.densify_scale_threshold,
+                max_points=args.max_gaussians,
+                max_screen_radius=args.prune_screen_radius,
+                split_factor=args.split_factor,
+                scale_shrink=args.split_scale_factor,
+                clone_jitter=args.clone_jitter,
+                world_prune_scale=args.world_prune_scale,
             )
+            structure_changed = density_log["changed"]
+            if structure_changed:
+                optimizer = rebuild_optimizer(model, args)
+
+        if (
+            args.opacity_reset_interval > 0
+            and iteration % args.opacity_reset_interval == 0
+            and iteration <= args.densify_until
+        ):
+            model.reset_opacity(args.opacity_reset_max)
+            optimizer = rebuild_optimizer(model, args)
+            structure_changed = True
+            opacity_reset_done = True
+
+        if iteration % args.log_every == 0 or iteration == 1:
+            mse_val = F.mse_loss(result["rgb"].detach(), gt.detach()).item()
+            psnr = mse_to_psnr(mse_val)
+            log_line = (
+                f"iter={iteration:05d} loss={loss.item():.6f} "
+                f"l1={loss_l1.item():.6f} dssim={loss_ssim.item():.6f} mse={mse_val:.6f} "
+                f"psnr={psnr:.2f}dB sh={model.active_sh_degree} points={model.num_points}"
+            )
+            if density_log is not None:
+                log_line += (
+                    f" densify[c={density_log['cloned']},"
+                    f"s={density_log['split_parents']}->{density_log['split_children']},"
+                    f"p={density_log['pruned']}]"
+                )
+            if opacity_reset_done:
+                log_line += " opacity_reset=1"
+            print(log_line)
 
         if iteration % args.preview_every == 0 or iteration == 1 or iteration == args.iterations:
             model.eval()
             with torch.no_grad():
-                preview = renderer.render_camera(preview_idx, model)
+                preview = renderer.render_camera(preview_idx, model, render_mode=args.render_mode)
                 preview_gt = renderer.get_ground_truth(preview_idx, device=model.xyz.device)
                 save_panel(
                     preview_dir / f"iter_{iteration:05d}.png",
                     preview["rgb"],
                     gt=preview_gt,
-                    alpha=preview["alpha"],
-                    depth=preview["depth"],
+                    include_alpha=False,
+                    include_depth=False,
                 )
             model.train()
 
-            val_stats = evaluate(renderer, model, val_ids if val_ids else train_ids)
+            val_stats = evaluate(renderer, model, val_ids if val_ids else train_ids, render_mode=args.render_mode)
             print(
                 f"eval iter={iteration:05d} val_l1={val_stats['l1']:.6f} "
                 f"val_ssim={val_stats['ssim']:.6f} val_mse={val_stats['mse']:.6f} val_psnr={val_stats['psnr']:.2f}dB"

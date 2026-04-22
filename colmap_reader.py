@@ -180,7 +180,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, image_scale
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[0]
             principal_point = intr.params[1:3]
-            FovY = focal2fov(focal_length_x, height)
+            FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model=="PINHOLE":
             focal_length_x = intr.params[0]

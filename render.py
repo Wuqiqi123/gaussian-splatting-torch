@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 from pathlib import Path
 
@@ -10,28 +11,74 @@ from torch import nn
 from colmap_reader import CameraInfo, read_colmap_scene_info
 from gs_model import GaussianModel
 
+try:
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+except Exception as exc:  # pragma: no cover - import availability depends on local CUDA build.
+    GaussianRasterizationSettings = None
+    GaussianRasterizer = None
+    _RASTERIZER_IMPORT_ERROR = exc
+else:
+    _RASTERIZER_IMPORT_ERROR = None
+
+
+def require_diff_gaussian_rasterizer() -> None:
+    if GaussianRasterizer is None or GaussianRasterizationSettings is None:
+        raise ImportError(
+            "diff-gaussian-rasterization is required. Install it with "
+            "`pip install git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git`."
+        ) from _RASTERIZER_IMPORT_ERROR
+
+
+def get_projection_matrix(znear: float, zfar: float, fov_x: float, fov_y: float) -> torch.Tensor:
+    tan_half_fov_y = math.tan(fov_y * 0.5)
+    tan_half_fov_x = math.tan(fov_x * 0.5)
+
+    top = tan_half_fov_y * znear
+    bottom = -top
+    right = tan_half_fov_x * znear
+    left = -right
+
+    proj = torch.zeros((4, 4), dtype=torch.float32)
+    proj[0, 0] = 2.0 * znear / (right - left)
+    proj[1, 1] = 2.0 * znear / (top - bottom)
+    proj[0, 2] = (right + left) / (right - left)
+    proj[1, 2] = (top + bottom) / (top - bottom)
+    proj[3, 2] = 1.0
+    proj[2, 2] = zfar / (zfar - znear)
+    proj[2, 3] = -(zfar * znear) / (zfar - znear)
+    return proj
+
+
+def normalize_render_mode(render_mode: str) -> str:
+    if render_mode not in {"diff", "non_tile", "tile"}:
+        raise ValueError(f"Unsupported render mode '{render_mode}'")
+    return render_mode
+
 
 class Render(nn.Module):
-    def __init__(self, camera_infos: list[CameraInfo], background_color=(0.0, 0.0, 0.0)):
+    def __init__(self, camera_infos: list[CameraInfo], background_color=(0.0, 0.0, 0.0), znear: float = 0.01, zfar: float = 100.0):
         super().__init__()
+        require_diff_gaussian_rasterizer()
         self.camera_infos = camera_infos
         self.image_names = [cam.image_name for cam in camera_infos]
         self.gt_images = [torch.from_numpy(cam.image).float() for cam in camera_infos]
-        self.register_buffer(
-            "world_to_cam",
-            torch.tensor(np.stack([cam.tf_world_cam for cam in camera_infos]), dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "focal",
-            torch.tensor(np.stack([cam.focal for cam in camera_infos]), dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "principal_point",
-            torch.tensor(np.stack([cam.principal_point for cam in camera_infos]), dtype=torch.float32),
-            persistent=False,
-        )
+
+        world_view = []
+        full_proj = []
+        camera_centers = []
+        fovs = []
+        for cam in camera_infos:
+            view = torch.tensor(cam.tf_world_cam, dtype=torch.float32).transpose(0, 1)
+            proj = get_projection_matrix(znear=znear, zfar=zfar, fov_x=float(cam.fov[0]), fov_y=float(cam.fov[1])).transpose(0, 1)
+            world_view.append(view)
+            full_proj.append(view @ proj)
+            camera_centers.append(torch.linalg.inv(view)[3, :3])
+            fovs.append(cam.fov.astype(np.float32))
+
+        self.register_buffer("world_view_transform", torch.stack(world_view), persistent=False)
+        self.register_buffer("full_proj_transform", torch.stack(full_proj), persistent=False)
+        self.register_buffer("camera_centers", torch.stack(camera_centers), persistent=False)
+        self.register_buffer("fov", torch.tensor(np.stack(fovs), dtype=torch.float32), persistent=False)
         self.register_buffer(
             "widths",
             torch.tensor([cam.width for cam in camera_infos], dtype=torch.long),
@@ -42,107 +89,19 @@ class Render(nn.Module):
             torch.tensor([cam.height for cam in camera_infos], dtype=torch.long),
             persistent=False,
         )
-        cam_centers = []
-        for cam in camera_infos:
-            rot = cam.tf_world_cam[:3, :3]
-            trans = cam.tf_world_cam[:3, 3]
-            cam_centers.append((-rot.T @ trans).astype(np.float32))
-        self.register_buffer(
-            "camera_centers",
-            torch.tensor(np.stack(cam_centers), dtype=torch.float32),
-            persistent=False,
-        )
         self.register_buffer(
             "background_color",
             torch.tensor(background_color, dtype=torch.float32),
             persistent=False,
         )
+        self.znear = float(znear)
+        self.zfar = float(zfar)
 
     def get_ground_truth(self, index: int, device: torch.device | str | None = None) -> torch.Tensor:
         image = self.gt_images[index]
         if device is not None:
             image = image.to(device)
         return image
-
-    def project(self, xyz: torch.Tensor, camera_index: int, cov_world: torch.Tensor):
-        world_to_cam = self.world_to_cam[camera_index].to(xyz.device)
-        rot = world_to_cam[:3, :3]
-        trans = world_to_cam[:3, 3]
-        focal = self.focal[camera_index].to(xyz.device)
-        principal_point = self.principal_point[camera_index].to(xyz.device)
-
-        cam_xyz = xyz @ rot.T + trans
-        z = cam_xyz[:, 2].clamp_min(1e-6)
-
-        means_2d = torch.empty((xyz.shape[0], 2), device=xyz.device, dtype=xyz.dtype)
-        means_2d[:, 0] = focal[0] * cam_xyz[:, 0] / z + principal_point[0]
-        means_2d[:, 1] = focal[1] * cam_xyz[:, 1] / z + principal_point[1]
-
-        cov_cam = rot.unsqueeze(0) @ cov_world @ rot.T.unsqueeze(0)
-
-        jacobian = torch.zeros((xyz.shape[0], 2, 3), device=xyz.device, dtype=xyz.dtype)
-        jacobian[:, 0, 0] = focal[0] / z
-        jacobian[:, 0, 2] = -focal[0] * cam_xyz[:, 0] / (z * z)
-        jacobian[:, 1, 1] = focal[1] / z
-        jacobian[:, 1, 2] = -focal[1] * cam_xyz[:, 1] / (z * z)
-
-        cov_2d = jacobian @ cov_cam @ jacobian.transpose(-1, -2)
-        blur = torch.eye(2, device=xyz.device, dtype=xyz.dtype).unsqueeze(0) * 0.3
-        cov_2d = cov_2d + blur
-        return cam_xyz, means_2d, cov_2d
-
-    def _prepare_gaussians(
-        self,
-        camera_index: int,
-        gaussian_model: GaussianModel,
-        scaling_modifier: float,
-        min_depth: float,
-        max_screen_radius: float,
-        margin_pixels: float,
-    ) -> dict | None:
-        device = gaussian_model.xyz.device
-        width = int(self.widths[camera_index].item())
-        height = int(self.heights[camera_index].item())
-
-        xyz = gaussian_model.xyz
-        cov_world = gaussian_model.get_covariance(scaling_modifier=scaling_modifier)
-        cam_xyz, means_2d, cov_2d = self.project(xyz, camera_index, cov_world)
-
-        cam_center = self.camera_centers[camera_index].to(device)
-        view_dirs = cam_center.unsqueeze(0) - xyz
-        view_dirs = view_dirs / view_dirs.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        colors = gaussian_model.get_colors(view_dirs)
-        opacity = gaussian_model.opacity.squeeze(-1)
-
-        eigvals = torch.linalg.eigvalsh(cov_2d)
-        max_eig = eigvals[:, 1].clamp_min(1e-8)
-        radius = (3.0 * torch.sqrt(max_eig)).clamp(max=max_screen_radius)
-
-        valid = cam_xyz[:, 2] > min_depth
-        valid &= opacity > 1e-4
-        valid &= radius > 0.25
-        valid &= means_2d[:, 0] + radius >= -margin_pixels
-        valid &= means_2d[:, 0] - radius < width + margin_pixels
-        valid &= means_2d[:, 1] + radius >= -margin_pixels
-        valid &= means_2d[:, 1] - radius < height + margin_pixels
-
-        valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(-1)
-        if valid_indices.numel() == 0:
-            return None
-
-        order = torch.argsort(cam_xyz[valid_indices, 2], descending=False)
-        valid_indices = valid_indices[order]
-        return {
-            "indices": valid_indices,
-            "cam_xyz": cam_xyz,
-            "means_2d": means_2d,
-            "cov_2d": cov_2d,
-            "colors": colors,
-            "opacity": opacity,
-            "radius": radius,
-            "width": width,
-            "height": height,
-        }
 
     def render_camera(
         self,
@@ -154,108 +113,59 @@ class Render(nn.Module):
         max_screen_radius: float = 64.0,
         margin_pixels: float = 1.0,
         tile_size: int = 64,
+        bbox_pad_pixels: float = 1.5,
+        render_mode: str = "diff",
     ) -> dict:
+        del min_depth, alpha_threshold, max_screen_radius, margin_pixels, tile_size, bbox_pad_pixels
+        normalize_render_mode(render_mode)
+
         device = gaussian_model.xyz.device
-        background = self.background_color.to(device)
+        if device.type != "cuda":
+            raise RuntimeError("diff-gaussian-rasterization requires a CUDA device")
 
-        prepared = self._prepare_gaussians(
-            camera_index=camera_index,
-            gaussian_model=gaussian_model,
-            scaling_modifier=scaling_modifier,
-            min_depth=min_depth,
-            max_screen_radius=max_screen_radius,
-            margin_pixels=margin_pixels,
+        means2d = torch.zeros_like(gaussian_model.xyz, dtype=gaussian_model.xyz.dtype, requires_grad=True, device=device)
+        try:
+            means2d.retain_grad()
+        except RuntimeError:
+            pass
+
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(self.heights[camera_index].item()),
+            image_width=int(self.widths[camera_index].item()),
+            tanfovx=math.tan(float(self.fov[camera_index, 0].item()) * 0.5),
+            tanfovy=math.tan(float(self.fov[camera_index, 1].item()) * 0.5),
+            bg=self.background_color.to(device=device, dtype=gaussian_model.xyz.dtype),
+            scale_modifier=scaling_modifier,
+            viewmatrix=self.world_view_transform[camera_index].to(device=device, dtype=gaussian_model.xyz.dtype),
+            projmatrix=self.full_proj_transform[camera_index].to(device=device, dtype=gaussian_model.xyz.dtype),
+            sh_degree=int(gaussian_model.active_sh_degree),
+            campos=self.camera_centers[camera_index].to(device=device, dtype=gaussian_model.xyz.dtype),
+            prefiltered=False,
+            debug=False,
         )
-        width = int(self.widths[camera_index].item())
-        height = int(self.heights[camera_index].item())
-        if prepared is None:
-            rgb = torch.ones((height, width, 3), device=device) * background
-            alpha = torch.zeros((height, width), device=device)
-            depth = torch.zeros((height, width), device=device)
-            return {"rgb": rgb, "alpha": alpha, "depth": depth}
+        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-        valid_indices = prepared["indices"]
-        cam_xyz = prepared["cam_xyz"]
-        means_2d = prepared["means_2d"]
-        cov_2d = prepared["cov_2d"]
-        colors = prepared["colors"]
-        opacity = prepared["opacity"]
-        radius = prepared["radius"]
-        radii = torch.ceil(radius[valid_indices])
-        means_valid = means_2d[valid_indices]
-        rect_min = torch.floor(means_valid - radii[:, None])
-        rect_max = torch.ceil(means_valid + radii[:, None])
-        rect_min[:, 0] = rect_min[:, 0].clamp(0, width - 1)
-        rect_min[:, 1] = rect_min[:, 1].clamp(0, height - 1)
-        rect_max[:, 0] = rect_max[:, 0].clamp(0, width - 1)
-        rect_max[:, 1] = rect_max[:, 1].clamp(0, height - 1)
+        color, radii = rasterizer(
+            means3D=gaussian_model.xyz,
+            means2D=means2d,
+            opacities=gaussian_model.opacity,
+            shs=gaussian_model.features,
+            scales=gaussian_model.scaling,
+            rotations=nn.functional.normalize(gaussian_model.rotation, dim=-1),
+            colors_precomp=None,
+            cov3D_precomp=None,
+        )
 
-        render_color = torch.ones((height, width, 3), device=device, dtype=means_2d.dtype) * background.view(1, 1, 3)
-        render_depth = torch.zeros((height, width, 1), device=device, dtype=means_2d.dtype)
-        render_alpha = torch.zeros((height, width, 1), device=device, dtype=means_2d.dtype)
-
-        for h in range(0, height, tile_size):
-            tile_h = min(tile_size, height - h)
-            for w in range(0, width, tile_size):
-                tile_w = min(tile_size, width - w)
-                overlap = rect_max[:, 0] >= w
-                overlap &= rect_min[:, 0] < w + tile_w
-                overlap &= rect_max[:, 1] >= h
-                overlap &= rect_min[:, 1] < h + tile_h
-                if not torch.any(overlap):
-                    continue
-
-                tile_indices = valid_indices[overlap]
-                tile_depths = cam_xyz[tile_indices, 2]
-                order = torch.argsort(tile_depths, descending=False)
-                tile_indices = tile_indices[order]
-                tile_depths = tile_depths[order]
-                tile_means = means_2d[tile_indices]
-                tile_cov = cov_2d[tile_indices]
-                tile_opacity = opacity[tile_indices].unsqueeze(0)
-                tile_color = colors[tile_indices]
-
-                pixel_x = torch.arange(w, w + tile_w, device=device)
-                pixel_y = torch.arange(h, h + tile_h, device=device)
-                yy_idx, xx_idx = torch.meshgrid(pixel_y, pixel_x, indexing="ij")
-                tile_coord = torch.stack(
-                    [xx_idx.to(means_2d.dtype) + 0.5, yy_idx.to(means_2d.dtype) + 0.5],
-                    dim=-1,
-                ).reshape(-1, 2)
-
-                conic = torch.linalg.inv(tile_cov)
-                dx = tile_coord[:, None, :] - tile_means[None, :, :]
-                mahalanobis = (
-                    dx[:, :, 0] * dx[:, :, 0] * conic[:, 0, 0]
-                    + dx[:, :, 1] * dx[:, :, 1] * conic[:, 1, 1]
-                    + dx[:, :, 0] * dx[:, :, 1] * (conic[:, 0, 1] + conic[:, 1, 0])
-                )
-
-                support_mask = mahalanobis <= 9.0
-                gauss_weight = torch.exp(-0.5 * mahalanobis) * support_mask
-                alpha = (gauss_weight[..., None] * tile_opacity[..., None]).clamp(max=0.99)
-                alpha = torch.where(alpha >= alpha_threshold, alpha, torch.zeros_like(alpha))
-                transmittance = torch.cat(
-                    [torch.ones_like(alpha[:, :1]), 1.0 - alpha[:, :-1]],
-                    dim=1,
-                ).cumprod(dim=1)
-                weights = transmittance * alpha
-                acc_alpha = weights.sum(dim=1)
-
-                tile_rgb = (weights * tile_color.unsqueeze(0)).sum(dim=1)
-                tile_rgb = tile_rgb + (1.0 - acc_alpha) * background.view(1, 3)
-                tile_depth = (weights[..., 0] * tile_depths.unsqueeze(0)).sum(dim=1, keepdim=True)
-                tile_depth = tile_depth / acc_alpha.clamp_min(1e-8)
-                tile_depth = torch.where(acc_alpha > 0, tile_depth, torch.zeros_like(tile_depth))
-
-                render_color[h : h + tile_h, w : w + tile_w] = tile_rgb.view(tile_h, tile_w, 3)
-                render_depth[h : h + tile_h, w : w + tile_w] = tile_depth.view(tile_h, tile_w, 1)
-                render_alpha[h : h + tile_h, w : w + tile_w] = acc_alpha.view(tile_h, tile_w, 1)
+        rgb = color.permute(1, 2, 0) if color.ndim == 3 and color.shape[0] in {1, 3} else color
+        visible_indices = torch.nonzero(radii > 0, as_tuple=False).squeeze(-1)
 
         return {
-            "rgb": render_color.clamp(0.0, 1.0),
-            "alpha": render_alpha[..., 0].clamp(0.0, 1.0),
-            "depth": render_depth[..., 0],
+            "rgb": rgb.clamp(0.0, 1.0),
+            "alpha": None,
+            "depth": None,
+            "viewspace_points": means2d,
+            "visible_indices": visible_indices,
+            "radii": radii,
         }
 
     def forward(self, indexes: torch.LongTensor, gaussian_model: GaussianModel, **kwargs) -> torch.Tensor:
@@ -295,14 +205,22 @@ def depth_to_rgb(depth: torch.Tensor, alpha: torch.Tensor) -> np.ndarray:
     return to_uint8(depth_rgb)
 
 
-def save_panel(path: str | os.PathLike, pred: torch.Tensor, gt: torch.Tensor | None = None, alpha: torch.Tensor | None = None, depth: torch.Tensor | None = None) -> None:
+def save_panel(
+    path: str | os.PathLike,
+    pred: torch.Tensor,
+    gt: torch.Tensor | None = None,
+    alpha: torch.Tensor | None = None,
+    depth: torch.Tensor | None = None,
+    include_alpha: bool = True,
+    include_depth: bool = True,
+) -> None:
     tiles = [to_uint8(pred)]
     if gt is not None:
         tiles.append(to_uint8(gt))
-    if alpha is not None:
+    if include_alpha and alpha is not None:
         alpha_rgb = alpha.unsqueeze(-1).repeat(1, 1, 3)
         tiles.append(to_uint8(alpha_rgb))
-    if depth is not None:
+    if include_depth and depth is not None:
         alpha_for_depth = alpha if alpha is not None else torch.ones_like(depth)
         tiles.append(depth_to_rgb(depth, alpha_for_depth))
     panel = np.concatenate(tiles, axis=1)
@@ -326,12 +244,15 @@ def load_checkpoint(checkpoint_path: str, data_path: str | None = None, image_sc
         seed=int(cfg.get("seed", 0)),
     ).to(device)
     model.restore(checkpoint["model"])
-    renderer = Render(scene.cameras, background_color=tuple(cfg.get("background_color", [0.0, 0.0, 0.0])))
+    background_color = cfg.get("background_color")
+    if background_color is None:
+        background_color = [1.0, 1.0, 1.0] if cfg.get("white_background", False) else [0.0, 0.0, 0.0]
+    renderer = Render(scene.cameras, background_color=tuple(background_color))
     return checkpoint, scene, model, renderer
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Pure Torch Gaussian splatting renderer")
+    parser = argparse.ArgumentParser(description="Gaussian splatting renderer backed by diff-gaussian-rasterization")
     parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint produced by train.py")
     parser.add_argument("--data", type=str, default=None, help="COLMAP scene root")
     parser.add_argument("--output", type=str, default="outputs/render", help="Directory to save rendered images")
@@ -341,6 +262,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-points", type=int, default=None, help="Override gaussian count used when loading")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--holdout-every", type=int, default=None, help="Override validation stride")
+    parser.add_argument("--render-mode", type=str, default="diff", choices=["diff", "non_tile", "tile"])
     return parser.parse_args()
 
 
@@ -372,7 +294,7 @@ def main() -> None:
     model.eval()
     with torch.no_grad():
         for render_idx, camera_idx in enumerate(camera_ids[: args.limit]):
-            result = renderer.render_camera(camera_idx, model)
+            result = renderer.render_camera(camera_idx, model, render_mode=args.render_mode)
             gt = renderer.get_ground_truth(camera_idx, device=model.xyz.device)
             filename = f"{render_idx:03d}_{renderer.image_names[camera_idx]}.png"
             save_panel(output_dir / filename, result["rgb"], gt=gt, alpha=result["alpha"], depth=result["depth"])
