@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -14,6 +14,20 @@ def inverse_sigmoid(x: torch.Tensor) -> torch.Tensor:
     eps = 1e-6
     x = x.clamp(min=eps, max=1.0 - eps)
     return torch.log(x / (1.0 - x))
+
+
+def get_expon_lr_func(lr_init, lr_final, lr_delay_mult=0.01, max_steps=30_000):
+    """Exponential learning rate decay, matching the official 3DGS schedule."""
+    def helper(step):
+        if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
+            return 0.0
+        if max_steps == 0:
+            return lr_final
+        t = step / max_steps
+        log_lerp = math.exp((1 - t) * math.log(lr_init + 1e-20) + t * math.log(lr_final + 1e-20))
+        delay_rate = lr_delay_mult + (1 - lr_delay_mult) * math.sin(0.5 * math.pi * min(t / (lr_delay_mult + 1e-8), 1.0))
+        return delay_rate * log_lerp
+    return helper
 
 
 def quaternion_to_matrix(quaternion: torch.Tensor) -> torch.Tensor:
@@ -63,8 +77,11 @@ def build_covariance_from_scaling_rotation(
 @dataclass
 class OptimConfig:
     position_lr_init: float = 1.6e-4
+    position_lr_final: float = 1.6e-6
+    position_lr_delay_mult: float = 0.01
+    position_lr_max_steps: int = 30_000
     feature_lr: float = 2.5e-3
-    opacity_lr: float = 5.0e-2
+    opacity_lr: float = 2.5e-2
     scaling_lr: float = 5.0e-3
     rotation_lr: float = 1.0e-3
 
@@ -101,7 +118,7 @@ class GaussianModel(nn.Module):
         rotation = torch.zeros((num_points, 4), dtype=torch.float32)
         rotation[:, 0] = 1.0
 
-        opacity = inverse_sigmoid(torch.full((num_points, 1), 0.25, dtype=torch.float32))
+        opacity = inverse_sigmoid(torch.full((num_points, 1), 0.1, dtype=torch.float32))
 
         self.xyz = nn.Parameter(points)
         self.features_dc = nn.Parameter(features[:, :1, :].contiguous())
@@ -139,12 +156,15 @@ class GaussianModel(nn.Module):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def training_setup(self, training_args) -> torch.optim.Optimizer:
+    def training_setup(self, training_args) -> tuple[torch.optim.Optimizer, object]:
         if isinstance(training_args, dict):
             cfg = OptimConfig(**training_args)
         else:
             cfg = OptimConfig(
                 position_lr_init=getattr(training_args, "position_lr_init", OptimConfig.position_lr_init),
+                position_lr_final=getattr(training_args, "position_lr_final", OptimConfig.position_lr_final),
+                position_lr_delay_mult=getattr(training_args, "position_lr_delay_mult", OptimConfig.position_lr_delay_mult),
+                position_lr_max_steps=getattr(training_args, "position_lr_max_steps", OptimConfig.position_lr_max_steps),
                 feature_lr=getattr(training_args, "feature_lr", OptimConfig.feature_lr),
                 opacity_lr=getattr(training_args, "opacity_lr", OptimConfig.opacity_lr),
                 scaling_lr=getattr(training_args, "scaling_lr", OptimConfig.scaling_lr),
@@ -154,12 +174,21 @@ class GaussianModel(nn.Module):
         param_groups = [
             {"params": [self.xyz], "lr": cfg.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {"params": [self.features_dc], "lr": cfg.feature_lr, "name": "f_dc"},
-            {"params": [self.features_rest], "lr": cfg.feature_lr * 0.25, "name": "f_rest"},
+            # Official uses feature_lr / 20 for rest SH coefficients
+            {"params": [self.features_rest], "lr": cfg.feature_lr / 20.0, "name": "f_rest"},
             {"params": [self.opacity_logits], "lr": cfg.opacity_lr, "name": "opacity"},
             {"params": [self.scaling_logits], "lr": cfg.scaling_lr, "name": "scaling"},
             {"params": [self.rotation], "lr": cfg.rotation_lr, "name": "rotation"},
         ]
-        return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+        optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+        # Exponential position LR scheduler matching official 3DGS
+        xyz_scheduler = get_expon_lr_func(
+            lr_init=cfg.position_lr_init * self.spatial_lr_scale,
+            lr_final=cfg.position_lr_final * self.spatial_lr_scale,
+            lr_delay_mult=cfg.position_lr_delay_mult,
+            max_steps=cfg.position_lr_max_steps,
+        )
+        return optimizer, xyz_scheduler
 
     def dist_kdtree(self, points_np: np.ndarray) -> torch.Tensor:
         dists, _ = KDTree(points_np).query(points_np, k=min(4, points_np.shape[0]))
@@ -316,9 +345,14 @@ class GaussianModel(nn.Module):
         split_factor: int = 2,
         scale_shrink: float = 1.6,
         clone_jitter: float = 0.35,
-        world_prune_scale: float = 0.15,
+        world_prune_scale: float = 0.1,
     ) -> dict:
-        changed = False
+        """
+        Densify-and-prune closely following the official 3DGS logic:
+          - Clone:  small Gaussians (max_scale <= percent_dense * extent) with high grad → copy in-place (no scale change, no jitter in position, keep opacity)
+          - Split:  large Gaussians (max_scale >  percent_dense * extent) with high grad → replace with N children, scale / (0.8*N)
+          - Prune:  low opacity OR large screen radius OR large world size (> 0.1 * extent)
+        """
         stats = {
             "changed": False,
             "cloned": 0,
@@ -329,132 +363,114 @@ class GaussianModel(nn.Module):
         }
         device = self.xyz.device
 
-        mean_grad = self.xyz_gradient_accum / self.denom.clamp_min(1.0)
-        mean_grad = torch.nan_to_num(mean_grad, nan=0.0, posinf=0.0, neginf=0.0)
-        xyz_grad = xyz_grad.to(device)
-        xyz_grad_norm = torch.norm(xyz_grad, dim=-1)
+        # --- Compute average 2D gradient norm (matches official accumulation) ---
+        grads = self.xyz_gradient_accum / self.denom.clamp_min(1.0)
+        grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
 
         opacity = self.opacity.detach().squeeze(-1)
         scales = self.scaling.detach().max(dim=-1).values
-        scale_limit = scale_threshold * scene_extent
-        world_prune_limit = world_prune_scale * scene_extent
+        scale_limit = scale_threshold * scene_extent  # percent_dense * extent
 
-        prune_mask = opacity < min_opacity
-        prune_mask |= self.max_radii2D > max_screen_radius
-        if world_prune_scale > 0.0:
-            prune_mask |= scales > world_prune_limit
-
-        clone_mask = mean_grad >= grad_threshold
-        clone_mask &= scales <= scale_limit
-        clone_mask &= opacity >= max(min_opacity * 1.5, 0.05)
-        clone_mask &= ~prune_mask
-
-        split_mask = mean_grad >= grad_threshold
-        split_mask &= scales > scale_limit
-        split_mask &= opacity >= max(min_opacity * 1.5, 0.05)
-        split_mask &= ~prune_mask
-
-        capacity = max(0, max_points - int((~prune_mask).sum().item()))
-        if capacity <= 0 and not prune_mask.any():
-            return stats
-
+        # --- Clone: small + high grad (copy as-is, same xyz/scale/opacity) ---
+        clone_mask = (grads >= grad_threshold) & (scales <= scale_limit)
         clone_idx = torch.nonzero(clone_mask, as_tuple=False).squeeze(-1)
+
+        # --- Split: large + high grad ---
+        split_mask = (grads >= grad_threshold) & (scales > scale_limit)
         split_idx = torch.nonzero(split_mask, as_tuple=False).squeeze(-1)
 
-        clone_quota = capacity
-        split_quota = capacity
-        if split_idx.numel() > 0:
-            max_split_seeds = max(0, capacity // max(split_factor, 1))
-            if max_split_seeds < split_idx.numel():
-                topk = torch.topk(mean_grad[split_idx], k=max_split_seeds, largest=True).indices
-                split_idx = split_idx[topk]
-            split_quota = max(0, capacity - split_idx.numel() * split_factor)
+        # Collect new points
+        new_xyz_list: list[torch.Tensor] = []
+        new_fdc_list: list[torch.Tensor] = []
+        new_frest_list: list[torch.Tensor] = []
+        new_scale_list: list[torch.Tensor] = []
+        new_rot_list: list[torch.Tensor] = []
+        new_opa_list: list[torch.Tensor] = []
 
-        if clone_idx.numel() > 0 and split_quota < clone_idx.numel():
-            keep = max(0, split_quota)
-            if keep > 0:
-                topk = torch.topk(mean_grad[clone_idx], k=keep, largest=True).indices
-                clone_idx = clone_idx[topk]
+        # Clone: duplicate points at same position (official: new_xyz = _xyz[mask])
+        if clone_idx.numel() > 0:
+            new_xyz_list.append(self.xyz.detach()[clone_idx])
+            new_fdc_list.append(self.features_dc.detach()[clone_idx])
+            new_frest_list.append(self.features_rest.detach()[clone_idx])
+            new_scale_list.append(self.scaling_logits.detach()[clone_idx])
+            new_rot_list.append(self.rotation.detach()[clone_idx])
+            new_opa_list.append(self.opacity_logits.detach()[clone_idx])
+            stats["cloned"] = clone_idx.numel()
+
+        # Split: sample N children around parent, scale / (0.8*N), remove parent
+        if split_idx.numel() > 0:
+            stds = self.scaling.detach()[split_idx].repeat(split_factor, 1)
+            means = torch.zeros_like(stds)
+            samples = torch.normal(mean=means, std=stds)
+            rots_mat = quaternion_to_matrix(self.rotation.detach()[split_idx]).repeat(split_factor, 1, 1)
+            new_xyz = torch.bmm(rots_mat, samples.unsqueeze(-1)).squeeze(-1) + self.xyz.detach()[split_idx].repeat(split_factor, 1)
+            new_scale = self.scaling_inverse_activation(
+                self.scaling.detach()[split_idx].repeat(split_factor, 1) / (0.8 * split_factor)
+            )
+            new_xyz_list.append(new_xyz)
+            new_fdc_list.append(self.features_dc.detach()[split_idx].repeat(split_factor, 1, 1))
+            new_frest_list.append(self.features_rest.detach()[split_idx].repeat(split_factor, 1, 1))
+            new_scale_list.append(new_scale)
+            new_rot_list.append(self.rotation.detach()[split_idx].repeat(split_factor, 1))
+            new_opa_list.append(self.opacity_logits.detach()[split_idx].repeat(split_factor, 1))
+            stats["split_parents"] = split_idx.numel()
+            stats["split_children"] = split_idx.numel() * split_factor
+
+        # --- Append new points ---
+        if new_xyz_list:
+            new_xyz = torch.cat(new_xyz_list, dim=0)
+            new_fdc = torch.cat(new_fdc_list, dim=0)
+            new_frest = torch.cat(new_frest_list, dim=0)
+            new_scale = torch.cat(new_scale_list, dim=0)
+            new_rot = torch.cat(new_rot_list, dim=0)
+            new_opa = torch.cat(new_opa_list, dim=0)
+            self.append_points(new_xyz, new_fdc, new_frest, new_scale, new_rot, new_opa)
+
+        # --- Prune: low opacity, huge screen radius, huge world scale + split parents ---
+        opacity_after = self.opacity.detach().squeeze(-1)
+        scales_after = self.scaling.detach().max(dim=-1).values
+        prune_mask = opacity_after < min_opacity
+        if max_screen_radius is not None and max_screen_radius > 0:
+            # max_radii2D only has shape of the old points; pad with zeros for new ones
+            pad = self.num_points - self.max_radii2D.shape[0]
+            if pad > 0:
+                padded_radii = torch.cat([self.max_radii2D, torch.zeros(pad, device=device)])
             else:
-                clone_idx = clone_idx[:0]
+                padded_radii = self.max_radii2D
+            prune_mask |= padded_radii > max_screen_radius
+        if world_prune_scale > 0.0:
+            prune_mask |= scales_after > world_prune_scale * scene_extent
 
-        # Do not disable pruning; allow it even with few points to prevent unbounded growth.
-        # The capacity guard above already prevents pruning all points to zero.
-        selected_split_mask = torch.zeros_like(split_mask)
+        # Remove original split parents (they were replaced by children)
         if split_idx.numel() > 0:
-            selected_split_mask[split_idx] = True
+            # split_idx refers to the OLD point ordering before appending new points
+            old_n = self.num_points - (stats["cloned"] + stats["split_children"])
+            split_parent_mask = torch.zeros(self.num_points, dtype=torch.bool, device=device)
+            # The old points are at indices [0, old_n)
+            if old_n > 0 and split_idx.max() < old_n:
+                split_parent_mask[split_idx] = True
+            prune_mask = prune_mask | split_parent_mask
 
         stats["pruned"] = int(prune_mask.sum().item())
-        stats["cloned"] = int(clone_idx.numel())
-        stats["split_parents"] = int(split_idx.numel())
-        stats["split_children"] = int(split_idx.numel() * split_factor)
-
-        old_xyz = self.xyz.detach()
-        old_features_dc = self.features_dc.detach()
-        old_features_rest = self.features_rest.detach()
-        old_scaling = self.scaling_logits.detach()
-        old_rotation = self.rotation.detach()
-        old_opacity = self.opacity_logits.detach()
-
-        keep_base_mask = ~prune_mask & ~selected_split_mask
-        new_xyz_all = [old_xyz[keep_base_mask]]
-        new_features_dc_all = [old_features_dc[keep_base_mask]]
-        new_features_rest_all = [old_features_rest[keep_base_mask]]
-        new_scaling_all = [old_scaling[keep_base_mask]]
-        new_rotation_all = [old_rotation[keep_base_mask]]
-        new_opacity_all = [old_opacity[keep_base_mask]]
-
-        if clone_idx.numel() > 0:
-            direction = xyz_grad[clone_idx]
-            direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            step = self.scaling.detach()[clone_idx].mean(dim=-1, keepdim=True) * clone_jitter
-            new_xyz = old_xyz[clone_idx] + direction * step
-            new_features_dc = old_features_dc[clone_idx]
-            new_features_rest = old_features_rest[clone_idx]
-            new_scaling = old_scaling[clone_idx]
-            new_rotation = old_rotation[clone_idx]
-            new_opacity = old_opacity[clone_idx]
-            new_xyz_all.append(new_xyz)
-            new_features_dc_all.append(new_features_dc)
-            new_features_rest_all.append(new_features_rest)
-            new_scaling_all.append(new_scaling)
-            new_rotation_all.append(new_rotation)
-            new_opacity_all.append(new_opacity)
-            changed = True
-
-        if split_idx.numel() > 0:
-            split_children = self._split_points(split_idx, split_factor=split_factor, scale_shrink=scale_shrink)
-            new_xyz_all.append(split_children[0])
-            new_features_dc_all.append(split_children[1])
-            new_features_rest_all.append(split_children[2])
-            new_scaling_all.append(split_children[3])
-            new_rotation_all.append(split_children[4])
-            new_opacity_all.append(split_children[5])
-            changed = True
-
-        if prune_mask.any():
-            changed = True
-
+        changed = (stats["cloned"] + stats["split_parents"] + stats["pruned"]) > 0
         if changed:
-            old_xyz = torch.cat(new_xyz_all, dim=0)
-            old_features_dc = torch.cat(new_features_dc_all, dim=0)
-            old_features_rest = torch.cat(new_features_rest_all, dim=0)
-            old_scaling = torch.cat(new_scaling_all, dim=0)
-            old_rotation = torch.cat(new_rotation_all, dim=0)
-            old_opacity = torch.cat(new_opacity_all, dim=0)
-            if old_xyz.shape[0] > max_points:
-                keep = max_points
-                keep_indices = torch.topk(torch.sigmoid(old_opacity).squeeze(-1), k=keep, largest=True).indices
-                old_xyz = old_xyz[keep_indices]
-                old_features_dc = old_features_dc[keep_indices]
-                old_features_rest = old_features_rest[keep_indices]
-                old_scaling = old_scaling[keep_indices]
-                old_rotation = old_rotation[keep_indices]
-                old_opacity = old_opacity[keep_indices]
-            self._set_parameters(old_xyz, old_features_dc, old_features_rest, old_scaling, old_rotation, old_opacity)
+            keep_mask = ~prune_mask
+            self._set_parameters(
+                self.xyz.detach()[keep_mask],
+                self.features_dc.detach()[keep_mask],
+                self.features_rest.detach()[keep_mask],
+                self.scaling_logits.detach()[keep_mask],
+                self.rotation.detach()[keep_mask],
+                self.opacity_logits.detach()[keep_mask],
+            )
+
         stats["changed"] = changed
         stats["final_points"] = self.num_points
         return stats
+
+    @staticmethod
+    def scaling_inverse_activation(x: torch.Tensor) -> torch.Tensor:
+        return torch.log(x.clamp_min(1e-8))
 
     def capture(self) -> dict:
         return {
@@ -465,7 +481,19 @@ class GaussianModel(nn.Module):
         }
 
     def restore(self, payload: dict) -> None:
-        self.load_state_dict(payload["state_dict"])
+        state = payload["state_dict"]
+        # Resize parameters to match checkpoint shape before loading
+        num_points = state["xyz"].shape[0]
+        sh_dim = (self.max_sh_degree + 1) ** 2
+        device = self.xyz.device
+        self.xyz = nn.Parameter(torch.zeros((num_points, 3), device=device))
+        self.features_dc = nn.Parameter(torch.zeros((num_points, 1, 3), device=device))
+        self.features_rest = nn.Parameter(torch.zeros((num_points, sh_dim - 1, 3), device=device))
+        self.scaling_logits = nn.Parameter(torch.zeros((num_points, 3), device=device))
+        self.rotation = nn.Parameter(torch.zeros((num_points, 4), device=device))
+        self.opacity_logits = nn.Parameter(torch.zeros((num_points, 1), device=device))
+        self._reset_density_state()
+        self.load_state_dict(state)
         self.active_sh_degree = int(payload.get("active_sh_degree", 0))
         self.max_sh_degree = int(payload.get("max_sh_degree", self.max_sh_degree))
 

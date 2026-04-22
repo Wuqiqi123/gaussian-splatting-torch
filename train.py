@@ -35,8 +35,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--position-lr-init", type=float, default=1.6e-4)
+    parser.add_argument("--position-lr-final", type=float, default=1.6e-6)
+    parser.add_argument("--position-lr-delay-mult", type=float, default=0.01)
+    parser.add_argument("--position-lr-max-steps", type=int, default=30_000)
     parser.add_argument("--feature-lr", type=float, default=2.5e-3)
-    parser.add_argument("--opacity-lr", type=float, default=5.0e-2)
+    parser.add_argument("--opacity-lr", type=float, default=2.5e-2)
     parser.add_argument("--scaling-lr", type=float, default=5.0e-3)
     parser.add_argument("--rotation-lr", type=float, default=1.0e-3)
 
@@ -45,22 +48,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opacity-reg", type=float, default=1.0e-4)
     parser.add_argument("--scale-reg", type=float, default=1.0e-4)
     parser.add_argument("--sh-degree", type=int, default=3)
-    parser.add_argument("--sh-upgrade-every", type=int, default=500)
+    parser.add_argument("--sh-upgrade-every", type=int, default=1000)
 
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--preview-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--preview-index", type=int, default=0, help="Validation view index inside split list")
 
-    parser.add_argument("--densify-from", type=int, default=200)
-    parser.add_argument("--densify-until", type=int, default=2500)
+    parser.add_argument("--densify-from", type=int, default=500)
+    parser.add_argument("--densify-until", type=int, default=15000)
     parser.add_argument("--densify-interval", type=int, default=100)
     parser.add_argument("--densify-grad-threshold", type=float, default=2e-4)
     parser.add_argument("--densify-scale-threshold", type=float, default=0.01)
     parser.add_argument("--prune-opacity-threshold", type=float, default=0.005)
-    parser.add_argument("--prune-screen-radius", type=float, default=64.0)
-    parser.add_argument("--world-prune-scale", type=float, default=1.0)
-    parser.add_argument("--max-gaussians", type=int, default=12000)
+    parser.add_argument("--prune-screen-radius", type=float, default=20.0)
+    parser.add_argument("--world-prune-scale", type=float, default=0.1)
+    parser.add_argument("--max-gaussians", type=int, default=1_000_000)
     parser.add_argument("--split-factor", type=int, default=2)
     parser.add_argument("--split-scale-factor", type=float, default=1.6)
     parser.add_argument("--clone-jitter", type=float, default=0.35)
@@ -153,8 +156,16 @@ def save_checkpoint(path: Path, model: GaussianModel, args: argparse.Namespace, 
     torch.save(payload, path)
 
 
-def rebuild_optimizer(model: GaussianModel, args: argparse.Namespace) -> torch.optim.Optimizer:
+def rebuild_optimizer(model: GaussianModel, args: argparse.Namespace) -> tuple:
     return model.training_setup(args)
+
+
+def update_xyz_lr(optimizer: torch.optim.Optimizer, xyz_scheduler, iteration: int) -> None:
+    """Apply exponential LR decay to xyz parameter group."""
+    for group in optimizer.param_groups:
+        if group["name"] == "xyz":
+            group["lr"] = xyz_scheduler(iteration)
+            break
 
 
 def main() -> None:
@@ -177,7 +188,7 @@ def main() -> None:
         seed=args.seed,
     ).to(args.device)
     renderer = Render(scene.cameras, background_color=background)
-    optimizer = rebuild_optimizer(model, args)
+    optimizer, xyz_scheduler = rebuild_optimizer(model, args)
     scene_extent = float(scene.nerf_normalization["radius"])
 
     train_ids, val_ids = split_indices(len(scene.cameras), args.holdout_every)
@@ -201,6 +212,10 @@ def main() -> None:
     for iteration in range(1, args.iterations + 1):
         density_log = None
         opacity_reset_done = False
+
+        # Update xyz exponential LR decay every iteration (matches official)
+        update_xyz_lr(optimizer, xyz_scheduler, iteration)
+
         if args.sh_upgrade_every > 0 and iteration % args.sh_upgrade_every == 0:
             model.oneupSHdegree()
 
@@ -227,7 +242,6 @@ def main() -> None:
                 visible_indices=result["visible_indices"],
                 radii=result["radii"].detach(),
             )
-        xyz_grad = model.xyz.grad.detach().clone() if model.xyz.grad is not None else torch.zeros_like(model.xyz)
         optimizer.step()
 
         structure_changed = False
@@ -237,7 +251,7 @@ def main() -> None:
             and iteration % args.densify_interval == 0
         ):
             density_log = model.densify_and_prune(
-                xyz_grad=xyz_grad,
+                xyz_grad=model.xyz.grad.detach().clone() if model.xyz.grad is not None else torch.zeros_like(model.xyz),
                 grad_threshold=args.densify_grad_threshold,
                 min_opacity=args.prune_opacity_threshold,
                 scene_extent=scene_extent,
@@ -251,7 +265,7 @@ def main() -> None:
             )
             structure_changed = density_log["changed"]
             if structure_changed:
-                optimizer = rebuild_optimizer(model, args)
+                optimizer, xyz_scheduler = rebuild_optimizer(model, args)
 
         if (
             args.opacity_reset_interval > 0
@@ -259,7 +273,7 @@ def main() -> None:
             and iteration <= args.densify_until
         ):
             model.reset_opacity(args.opacity_reset_max)
-            optimizer = rebuild_optimizer(model, args)
+            optimizer, xyz_scheduler = rebuild_optimizer(model, args)
             structure_changed = True
             opacity_reset_done = True
 

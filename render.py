@@ -142,10 +142,11 @@ class Render(nn.Module):
             campos=self.camera_centers[camera_index].to(device=device, dtype=gaussian_model.xyz.dtype),
             prefiltered=False,
             debug=False,
+            antialiasing=False,
         )
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-        color, radii = rasterizer(
+        render_out = rasterizer(
             means3D=gaussian_model.xyz,
             means2D=means2d,
             opacities=gaussian_model.opacity,
@@ -155,6 +156,7 @@ class Render(nn.Module):
             colors_precomp=None,
             cov3D_precomp=None,
         )
+        color, radii = render_out[0], render_out[1]
 
         rgb = color.permute(1, 2, 0) if color.ndim == 3 and color.shape[0] in {1, 3} else color
         visible_indices = torch.nonzero(radii > 0, as_tuple=False).squeeze(-1)
