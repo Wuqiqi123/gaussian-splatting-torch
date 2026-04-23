@@ -13,6 +13,12 @@ from colmap_reader import read_colmap_scene_info
 from gs_model import GaussianModel
 from render import Render, save_panel, split_indices
 
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Gaussian splats on a COLMAP scene with diff-gaussian-rasterization")
@@ -69,6 +75,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clone-jitter", type=float, default=0.35)
     parser.add_argument("--opacity-reset-interval", type=int, default=3000)
     parser.add_argument("--opacity-reset-max", type=float, default=0.01)
+
+    # W&B
+    parser.add_argument("--wandb-project", type=str, default="gaussian-splatting", help="W&B project name")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name (defaults to output dir name)")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
     return parser.parse_args()
 
 
@@ -168,6 +179,13 @@ def update_xyz_lr(optimizer: torch.optim.Optimizer, xyz_scheduler, iteration: in
             break
 
 
+def _get_lr(optimizer: torch.optim.Optimizer, name: str) -> float:
+    for group in optimizer.param_groups:
+        if group.get("name") == name:
+            return group["lr"]
+    return 0.0
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -177,6 +195,19 @@ def main() -> None:
     preview_dir = output_dir / "previews"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     preview_dir.mkdir(parents=True, exist_ok=True)
+
+    # W&B init
+    use_wandb = _WANDB_AVAILABLE and not args.no_wandb
+    if use_wandb:
+        run_name = args.wandb_run_name or Path(args.output).name
+        wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            config=vars(args),
+            dir=str(output_dir),
+        )
+    elif not args.no_wandb and not _WANDB_AVAILABLE:
+        print("wandb not installed — run `pip install wandb` to enable logging. Continuing without it.")
 
     scene = read_colmap_scene_info(args.data, image_scale=args.image_scale)
     background = (1.0, 1.0, 1.0) if args.white_background else (0.0, 0.0, 0.0)
@@ -295,13 +326,42 @@ def main() -> None:
                 log_line += " opacity_reset=1"
             print(log_line)
 
+            if use_wandb:
+                wb_log: dict = {
+                    "train/loss": loss.item(),
+                    "train/loss_l1": loss_l1.item(),
+                    "train/loss_dssim": loss_ssim.item(),
+                    "train/psnr": psnr,
+                    "train/mse": mse_val,
+                    "scene/num_gaussians": model.num_points,
+                    "scene/sh_degree": model.active_sh_degree,
+                    "lr/xyz": _get_lr(optimizer, "xyz"),
+                    "lr/f_dc": _get_lr(optimizer, "f_dc"),
+                    "lr/f_rest": _get_lr(optimizer, "f_rest"),
+                    "lr/opacity": _get_lr(optimizer, "opacity"),
+                    "lr/scaling": _get_lr(optimizer, "scaling"),
+                    "lr/rotation": _get_lr(optimizer, "rotation"),
+                }
+                if density_log is not None:
+                    wb_log.update({
+                        "densify/cloned": density_log["cloned"],
+                        "densify/split_parents": density_log["split_parents"],
+                        "densify/split_children": density_log["split_children"],
+                        "densify/pruned": density_log["pruned"],
+                        "densify/final_points": density_log["final_points"],
+                    })
+                if opacity_reset_done:
+                    wb_log["scene/opacity_reset"] = 1
+                wandb.log(wb_log, step=iteration)
+
         if iteration % args.preview_every == 0 or iteration == 1 or iteration == args.iterations:
             model.eval()
+            preview_path = preview_dir / f"iter_{iteration:05d}.png"
             with torch.no_grad():
                 preview = renderer.render_camera(preview_idx, model, render_mode=args.render_mode)
                 preview_gt = renderer.get_ground_truth(preview_idx, device=model.xyz.device)
                 save_panel(
-                    preview_dir / f"iter_{iteration:05d}.png",
+                    preview_path,
                     preview["rgb"],
                     gt=preview_gt,
                     include_alpha=False,
@@ -318,10 +378,25 @@ def main() -> None:
                 best_val_psnr = val_stats["psnr"]
                 save_checkpoint(checkpoint_dir / "best.pt", model, args, iteration)
 
+            if use_wandb:
+                wandb.log(
+                    {
+                        "val/psnr": val_stats["psnr"],
+                        "val/ssim": val_stats["ssim"],
+                        "val/l1": val_stats["l1"],
+                        "val/mse": val_stats["mse"],
+                        "val/best_psnr": best_val_psnr,
+                        "media/preview": wandb.Image(str(preview_path), caption=f"iter {iteration}"),
+                    },
+                    step=iteration,
+                )
+
         if iteration % args.save_every == 0 or iteration == args.iterations:
             save_checkpoint(checkpoint_dir / f"iter_{iteration:05d}.pt", model, args, iteration)
             save_checkpoint(checkpoint_dir / "latest.pt", model, args, iteration)
 
+    if use_wandb:
+        wandb.finish()
     print(f"Training finished. Latest checkpoint: {checkpoint_dir / 'latest.pt'}")
 
 
