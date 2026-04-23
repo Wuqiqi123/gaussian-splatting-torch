@@ -57,7 +57,14 @@ def normalize_render_mode(render_mode: str) -> str:
 
 
 class Render(nn.Module):
-    def __init__(self, camera_infos: list[CameraInfo], background_color=(0.0, 0.0, 0.0), znear: float = 0.01, zfar: float = 100.0, probes: "LightingProbes | None" = None):
+    def __init__(
+        self,
+        camera_infos: list[CameraInfo],
+        background_color=(0.0, 0.0, 0.0),
+        znear: float = 0.01,
+        zfar: float = 100.0,
+        probes: "LightingProbes | None" = None,
+    ):
         super().__init__()
         require_diff_gaussian_rasterizer()
         self.camera_infos = camera_infos
@@ -148,16 +155,11 @@ class Render(nn.Module):
         )
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-        # Compute colors_precomp if probes are available
-        colors_precomp = None
+        # Augment Gaussian SH coefficients with probe delta if probes are active
         shs = gaussian_model.features
         if self.probes is not None:
-            campos = self.camera_centers[camera_index].to(device=device, dtype=gaussian_model.xyz.dtype)
-            view_dirs = nn.functional.normalize(campos.unsqueeze(0) - gaussian_model.xyz, dim=-1)
-            sh_colors = gaussian_model.get_colors(view_dirs)          # [N, 3]
-            probe_colors = self.probes.query(gaussian_model.xyz, view_dirs)  # [N, 3]
-            colors_precomp = (sh_colors + probe_colors).clamp(0.0, 1.0)
-            shs = None
+            sh_delta = self.probes.query(gaussian_model.xyz, gaussian_model.active_sh_degree)
+            shs = shs + sh_delta
 
         render_out = rasterizer(
             means3D=gaussian_model.xyz,
@@ -166,7 +168,7 @@ class Render(nn.Module):
             shs=shs,
             scales=gaussian_model.scaling,
             rotations=nn.functional.normalize(gaussian_model.rotation, dim=-1),
-            colors_precomp=colors_precomp,
+            colors_precomp=None,
             cov3D_precomp=None,
         )
         color, radii = render_out[0], render_out[1]
@@ -270,12 +272,19 @@ def load_checkpoint(checkpoint_path: str, data_path: str | None = None, image_sc
         import torch as _torch
         from lighting_probes import LightingProbes
         dummy_aabb = _torch.zeros(2, 3)
-        probes = LightingProbes(dummy_aabb, grid_size=int(probe_payload["grid_size"]),
-                                cubemap_res=int(probe_payload["cubemap_res"]),
-                                k_nearest=int(probe_payload["k_nearest"])).to(device)
+        probes = LightingProbes(
+            dummy_aabb,
+            grid_size=int(probe_payload["grid_size"]),
+            sh_degree=int(probe_payload.get("sh_degree", 3)),
+            k_nearest=int(probe_payload["k_nearest"]),
+        ).to(device)
         probes.restore(probe_payload)
 
-    renderer = Render(scene.cameras, background_color=tuple(background_color), probes=probes)
+    renderer = Render(
+        scene.cameras,
+        background_color=tuple(background_color),
+        probes=probes,
+    )
     return checkpoint, scene, model, renderer
 
 

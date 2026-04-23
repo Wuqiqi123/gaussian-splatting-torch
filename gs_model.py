@@ -148,11 +148,6 @@ class GaussianModel(nn.Module):
     def get_covariance(self, scaling_modifier: float = 1.0) -> torch.Tensor:
         return build_covariance_from_scaling_rotation(self.scaling, scaling_modifier, self.rotation)
 
-    def get_colors(self, view_dirs: torch.Tensor) -> torch.Tensor:
-        sh_coeff = self.features.transpose(1, 2)
-        rgb = eval_sh(self.active_sh_degree, sh_coeff, view_dirs)
-        return torch.clamp(rgb + 0.5, 0.0, 1.0)
-
     def oneupSHdegree(self) -> None:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
@@ -176,14 +171,13 @@ class GaussianModel(nn.Module):
         param_groups = [
             {"params": [self.xyz], "lr": cfg.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {"params": [self.features_dc], "lr": cfg.feature_lr, "name": "f_dc"},
-            # Official uses feature_lr / 20 for rest SH coefficients
             {"params": [self.features_rest], "lr": cfg.feature_lr / 20.0, "name": "f_rest"},
             {"params": [self.opacity_logits], "lr": cfg.opacity_lr, "name": "opacity"},
             {"params": [self.scaling_logits], "lr": cfg.scaling_lr, "name": "scaling"},
             {"params": [self.rotation], "lr": cfg.rotation_lr, "name": "rotation"},
         ]
         if probes is not None:
-            param_groups.append({"params": [probes.cubemaps], "lr": cfg.probe_lr, "name": "probes"})
+            param_groups.append({"params": [probes.sh_coeffs], "lr": cfg.probe_lr, "name": "probes"})
         optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
         # Exponential position LR scheduler matching official 3DGS
         xyz_scheduler = get_expon_lr_func(
@@ -486,7 +480,6 @@ class GaussianModel(nn.Module):
 
     def restore(self, payload: dict) -> None:
         state = payload["state_dict"]
-        # Resize parameters to match checkpoint shape before loading
         num_points = state["xyz"].shape[0]
         sh_dim = (self.max_sh_degree + 1) ** 2
         device = self.xyz.device
@@ -497,7 +490,9 @@ class GaussianModel(nn.Module):
         self.rotation = nn.Parameter(torch.zeros((num_points, 4), device=device))
         self.opacity_logits = nn.Parameter(torch.zeros((num_points, 1), device=device))
         self._reset_density_state()
-        self.load_state_dict(state)
+        # Drop legacy specular_logits key if present in old checkpoints
+        state = {k: v for k, v in state.items() if k != "specular_logits"}
+        self.load_state_dict(state, strict=False)
         self.active_sh_degree = int(payload.get("active_sh_degree", 0))
         self.max_sh_degree = int(payload.get("max_sh_degree", self.max_sh_degree))
 

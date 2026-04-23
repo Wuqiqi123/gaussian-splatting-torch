@@ -27,6 +27,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default="outputs/playroom", help="Output directory")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--resume",
+        type=str,
+        nargs="?",
+        const="auto",
+        default=None,
+        help="Resume from a checkpoint path, or from <output>/checkpoints/latest.pt if no path is given.",
+    )
 
     parser.add_argument("--iterations", type=int, default=10000)
     parser.add_argument("--image-scale", type=int, default=1, help="Downsample factor for training images")
@@ -79,9 +87,10 @@ def parse_args() -> argparse.Namespace:
 
     # Lighting probes
     parser.add_argument("--probe-grid-size", type=int, default=3, help="Probes per axis (total = N^3)")
-    parser.add_argument("--probe-cubemap-res", type=int, default=8, help="Cubemap face resolution")
-    parser.add_argument("--probe-lr", type=float, default=1e-3, help="Learning rate for probe cubemaps")
+    parser.add_argument("--probe-sh-degree", type=int, default=None, help="SH degree for probes (defaults to --sh-degree)")
+    parser.add_argument("--probe-lr", type=float, default=1e-3, help="Learning rate for probe SH coefficients")
     parser.add_argument("--probe-k-nearest", type=int, default=4, help="Probes to blend per Gaussian")
+    parser.add_argument("--probe-start-iter", type=int, default=3000, help="Keep probes disabled until this iteration")
     parser.add_argument("--no-probes", action="store_true", help="Disable lighting probes")
 
     # W&B
@@ -141,7 +150,13 @@ def ssim(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) -> torch
     return ssim_map.mean()
 
 
-def evaluate(renderer: Render, model: GaussianModel, camera_ids: list[int], max_views: int = 4, render_mode: str = "non_tile") -> dict:
+def evaluate(
+    renderer: Render,
+    model: GaussianModel,
+    camera_ids: list[int],
+    max_views: int = 4,
+    render_mode: str = "non_tile",
+) -> dict:
     if not camera_ids:
         return {"l1": 0.0, "mse": 0.0, "psnr": 0.0, "ssim": 0.0}
 
@@ -166,12 +181,20 @@ def evaluate(renderer: Render, model: GaussianModel, camera_ids: list[int], max_
     return stats
 
 
-def save_checkpoint(path: Path, model: GaussianModel, args: argparse.Namespace, iteration: int, probes=None) -> None:
+def save_checkpoint(
+    path: Path,
+    model: GaussianModel,
+    args: argparse.Namespace,
+    iteration: int,
+    probes=None,
+    best_val_psnr: float | None = None,
+) -> None:
     payload = {
         "iteration": iteration,
         "config": vars(args),
         "model": model.capture(),
         "probes": probes.capture() if probes is not None else None,
+        "best_val_psnr": best_val_psnr,
     }
     torch.save(payload, path)
 
@@ -195,6 +218,26 @@ def _get_lr(optimizer: torch.optim.Optimizer, name: str) -> float:
     return 0.0
 
 
+def _resolve_resume_path(resume_arg: str | None, output_dir: Path) -> Path | None:
+    if resume_arg is None:
+        return None
+    if resume_arg == "auto":
+        return output_dir / "checkpoints" / "latest.pt"
+    return Path(resume_arg)
+
+
+def _restore_probes_from_payload(payload: dict, device: str | torch.device) -> LightingProbes:
+    dummy_aabb = torch.zeros(2, 3)
+    probes = LightingProbes(
+        dummy_aabb,
+        grid_size=int(payload["grid_size"]),
+        sh_degree=int(payload.get("sh_degree", 3)),
+        k_nearest=int(payload["k_nearest"]),
+    ).to(device)
+    probes.restore(payload)
+    return probes
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -204,6 +247,16 @@ def main() -> None:
     preview_dir = output_dir / "previews"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     preview_dir.mkdir(parents=True, exist_ok=True)
+
+    resume_path = _resolve_resume_path(args.resume, output_dir)
+    resume_checkpoint = None
+    start_iteration = 0
+    if resume_path is not None:
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        resume_checkpoint = torch.load(resume_path, map_location="cpu", weights_only=True)
+        start_iteration = int(resume_checkpoint.get("iteration", 0))
+        print(f"Resuming from {resume_path} at iter {start_iteration}")
 
     # W&B init
     use_wandb = _WANDB_AVAILABLE and not args.no_wandb
@@ -218,29 +271,47 @@ def main() -> None:
     elif not args.no_wandb and not _WANDB_AVAILABLE:
         print("wandb not installed — run `pip install wandb` to enable logging. Continuing without it.")
 
+    resume_cfg = resume_checkpoint.get("config", {}) if resume_checkpoint is not None else {}
+    resume_model_payload = resume_checkpoint.get("model", {}) if resume_checkpoint is not None else {}
+
     scene = read_colmap_scene_info(args.data, image_scale=args.image_scale)
     background = (1.0, 1.0, 1.0) if args.white_background else (0.0, 0.0, 0.0)
 
     model = GaussianModel(
         scene,
-        sh_degree=args.sh_degree,
+        sh_degree=int(resume_model_payload.get("max_sh_degree", resume_cfg.get("sh_degree", args.sh_degree))),
         max_points=args.max_points,
         seed=args.seed,
     ).to(args.device)
+    if resume_checkpoint is not None:
+        model.restore(resume_checkpoint["model"])
 
     # Lighting probes
     probes = None
-    if not args.no_probes:
+    if resume_checkpoint is not None:
+        if resume_checkpoint.get("probes") is not None:
+            probes = _restore_probes_from_payload(resume_checkpoint["probes"], args.device)
+            print(
+                f"Restored lighting probes: {probes.num_probes} probes ({probes.grid_size}^3)"
+            )
+        else:
+            print("Resume checkpoint has no lighting probes; continuing without probes.")
+    elif not args.no_probes:
         points = torch.as_tensor(scene.point_cloud.points, dtype=torch.float32)
+        probe_sh_degree = args.probe_sh_degree if args.probe_sh_degree is not None else args.sh_degree
         probes = build_probes_from_scene(
             points,
             grid_size=args.probe_grid_size,
-            cubemap_res=args.probe_cubemap_res,
+            sh_degree=probe_sh_degree,
             k_nearest=args.probe_k_nearest,
         ).to(args.device)
-        print(f"Lighting probes: {probes.num_probes} probes ({args.probe_grid_size}^3), cubemap {args.probe_cubemap_res}x{args.probe_cubemap_res}")
+        print(f"Lighting probes: {probes.num_probes} probes ({args.probe_grid_size}^3), sh_degree={probe_sh_degree}")
 
-    renderer = Render(scene.cameras, background_color=background, probes=probes)
+    renderer = Render(
+        scene.cameras,
+        background_color=background,
+        probes=probes,
+    )
     optimizer, xyz_scheduler = rebuild_optimizer(model, args, probes=probes)
     scene_extent = float(scene.nerf_normalization["radius"])
 
@@ -255,6 +326,8 @@ def main() -> None:
         "num_points": model.num_points,
         "image_scale": args.image_scale,
         "device": args.device,
+        "resume": str(resume_path) if resume_path is not None else None,
+        "start_iteration": start_iteration,
     }
     (output_dir / "run_config.json").write_text(json.dumps({**vars(args), **metadata}, indent=2), encoding="utf-8")
 
@@ -262,7 +335,16 @@ def main() -> None:
     print(f"Train views: {len(train_ids)}, Val views: {len(val_ids)}")
 
     best_val_psnr = float("-inf")
-    for iteration in range(1, args.iterations + 1):
+    if resume_checkpoint is not None and resume_checkpoint.get("best_val_psnr") is not None:
+        best_val_psnr = float(resume_checkpoint["best_val_psnr"])
+
+    if start_iteration >= args.iterations:
+        print(
+            f"Checkpoint iteration {start_iteration} already reaches target iterations {args.iterations}; nothing to do."
+        )
+        return
+
+    for iteration in range(start_iteration + 1, args.iterations + 1):
         density_log = None
         opacity_reset_done = False
 
@@ -273,7 +355,11 @@ def main() -> None:
             model.oneupSHdegree()
 
         camera_idx = random.choice(train_ids)
-        result = renderer.render_camera(camera_idx, model, render_mode=args.render_mode)
+        result = renderer.render_camera(
+            camera_idx,
+            model,
+            render_mode=args.render_mode,
+        )
         gt = renderer.get_ground_truth(camera_idx, device=model.xyz.device)
 
         loss_l1 = F.l1_loss(result["rgb"], gt)
@@ -319,6 +405,7 @@ def main() -> None:
             structure_changed = density_log["changed"]
             if structure_changed:
                 optimizer, xyz_scheduler = rebuild_optimizer(model, args, probes=probes)
+                update_xyz_lr(optimizer, xyz_scheduler, iteration)
 
         if (
             args.opacity_reset_interval > 0
@@ -327,6 +414,7 @@ def main() -> None:
         ):
             model.reset_opacity(args.opacity_reset_max)
             optimizer, xyz_scheduler = rebuild_optimizer(model, args, probes=probes)
+            update_xyz_lr(optimizer, xyz_scheduler, iteration)
             structure_changed = True
             opacity_reset_done = True
 
@@ -336,7 +424,8 @@ def main() -> None:
             log_line = (
                 f"iter={iteration:05d} loss={loss.item():.6f} "
                 f"l1={loss_l1.item():.6f} dssim={loss_ssim.item():.6f} mse={mse_val:.6f} "
-                f"psnr={psnr:.2f}dB sh={model.active_sh_degree} points={model.num_points}"
+                f"psnr={psnr:.2f}dB sh={model.active_sh_degree} points={model.num_points} "
+                f"probes={'on' if probes is not None else 'off'}"
             )
             if density_log is not None:
                 log_line += (
@@ -382,7 +471,11 @@ def main() -> None:
             model.eval()
             preview_path = preview_dir / f"iter_{iteration:05d}.png"
             with torch.no_grad():
-                preview = renderer.render_camera(preview_idx, model, render_mode=args.render_mode)
+                preview = renderer.render_camera(
+                    preview_idx,
+                    model,
+                    render_mode=args.render_mode,
+                )
                 preview_gt = renderer.get_ground_truth(preview_idx, device=model.xyz.device)
                 save_panel(
                     preview_path,
@@ -393,14 +486,26 @@ def main() -> None:
                 )
             model.train()
 
-            val_stats = evaluate(renderer, model, val_ids if val_ids else train_ids, render_mode=args.render_mode)
+            val_stats = evaluate(
+                renderer,
+                model,
+                val_ids if val_ids else train_ids,
+                render_mode=args.render_mode,
+            )
             print(
                 f"eval iter={iteration:05d} val_l1={val_stats['l1']:.6f} "
                 f"val_ssim={val_stats['ssim']:.6f} val_mse={val_stats['mse']:.6f} val_psnr={val_stats['psnr']:.2f}dB"
             )
             if val_stats["psnr"] > best_val_psnr:
                 best_val_psnr = val_stats["psnr"]
-                save_checkpoint(checkpoint_dir / "best.pt", model, args, iteration, probes=probes)
+                save_checkpoint(
+                    checkpoint_dir / "best.pt",
+                    model,
+                    args,
+                    iteration,
+                    probes=probes,
+                    best_val_psnr=best_val_psnr,
+                )
 
             if use_wandb:
                 wandb.log(
@@ -416,8 +521,22 @@ def main() -> None:
                 )
 
         if iteration % args.save_every == 0 or iteration == args.iterations:
-            save_checkpoint(checkpoint_dir / f"iter_{iteration:05d}.pt", model, args, iteration, probes=probes)
-            save_checkpoint(checkpoint_dir / "latest.pt", model, args, iteration, probes=probes)
+            save_checkpoint(
+                checkpoint_dir / f"iter_{iteration:05d}.pt",
+                model,
+                args,
+                iteration,
+                probes=probes,
+                best_val_psnr=best_val_psnr,
+            )
+            save_checkpoint(
+                checkpoint_dir / "latest.pt",
+                model,
+                args,
+                iteration,
+                probes=probes,
+                best_val_psnr=best_val_psnr,
+            )
 
     if use_wandb:
         wandb.finish()
