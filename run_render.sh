@@ -2,8 +2,8 @@
 set -e
 
 DATA="data/playroom"
-OUTPUT="outputs/playroom_fullres"
-CHECKPOINT="$OUTPUT/checkpoints/latest.pt"
+OUTPUT="outputs/playroom_v2"
+CHECKPOINT="$OUTPUT/checkpoints/best.pt"
 RENDER_OUT="$OUTPUT/render_val"
 
 cd "$(dirname "$0")"
