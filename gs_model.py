@@ -84,6 +84,7 @@ class OptimConfig:
     opacity_lr: float = 2.5e-2
     scaling_lr: float = 5.0e-3
     rotation_lr: float = 1.0e-3
+    probe_lr: float = 1.0e-3
 
 
 class GaussianModel(nn.Module):
@@ -156,9 +157,9 @@ class GaussianModel(nn.Module):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def training_setup(self, training_args) -> tuple[torch.optim.Optimizer, object]:
+    def training_setup(self, training_args, probes=None) -> tuple[torch.optim.Optimizer, object]:
         if isinstance(training_args, dict):
-            cfg = OptimConfig(**training_args)
+            cfg = OptimConfig(**{k: v for k, v in training_args.items() if k in OptimConfig.__dataclass_fields__})
         else:
             cfg = OptimConfig(
                 position_lr_init=getattr(training_args, "position_lr_init", OptimConfig.position_lr_init),
@@ -169,6 +170,7 @@ class GaussianModel(nn.Module):
                 opacity_lr=getattr(training_args, "opacity_lr", OptimConfig.opacity_lr),
                 scaling_lr=getattr(training_args, "scaling_lr", OptimConfig.scaling_lr),
                 rotation_lr=getattr(training_args, "rotation_lr", OptimConfig.rotation_lr),
+                probe_lr=getattr(training_args, "probe_lr", OptimConfig.probe_lr),
             )
 
         param_groups = [
@@ -180,6 +182,8 @@ class GaussianModel(nn.Module):
             {"params": [self.scaling_logits], "lr": cfg.scaling_lr, "name": "scaling"},
             {"params": [self.rotation], "lr": cfg.rotation_lr, "name": "rotation"},
         ]
+        if probes is not None:
+            param_groups.append({"params": [probes.cubemaps], "lr": cfg.probe_lr, "name": "probes"})
         optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
         # Exponential position LR scheduler matching official 3DGS
         xyz_scheduler = get_expon_lr_func(

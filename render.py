@@ -10,6 +10,7 @@ from torch import nn
 
 from colmap_reader import CameraInfo, read_colmap_scene_info
 from gs_model import GaussianModel
+from lighting_probes import LightingProbes
 
 try:
     from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
@@ -56,7 +57,7 @@ def normalize_render_mode(render_mode: str) -> str:
 
 
 class Render(nn.Module):
-    def __init__(self, camera_infos: list[CameraInfo], background_color=(0.0, 0.0, 0.0), znear: float = 0.01, zfar: float = 100.0):
+    def __init__(self, camera_infos: list[CameraInfo], background_color=(0.0, 0.0, 0.0), znear: float = 0.01, zfar: float = 100.0, probes: "LightingProbes | None" = None):
         super().__init__()
         require_diff_gaussian_rasterizer()
         self.camera_infos = camera_infos
@@ -96,6 +97,7 @@ class Render(nn.Module):
         )
         self.znear = float(znear)
         self.zfar = float(zfar)
+        self.probes = probes
 
     def get_ground_truth(self, index: int, device: torch.device | str | None = None) -> torch.Tensor:
         image = self.gt_images[index]
@@ -146,14 +148,25 @@ class Render(nn.Module):
         )
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
+        # Compute colors_precomp if probes are available
+        colors_precomp = None
+        shs = gaussian_model.features
+        if self.probes is not None:
+            campos = self.camera_centers[camera_index].to(device=device, dtype=gaussian_model.xyz.dtype)
+            view_dirs = nn.functional.normalize(campos.unsqueeze(0) - gaussian_model.xyz, dim=-1)
+            sh_colors = gaussian_model.get_colors(view_dirs)          # [N, 3]
+            probe_colors = self.probes.query(gaussian_model.xyz, view_dirs)  # [N, 3]
+            colors_precomp = (sh_colors + probe_colors).clamp(0.0, 1.0)
+            shs = None
+
         render_out = rasterizer(
             means3D=gaussian_model.xyz,
             means2D=means2d,
             opacities=gaussian_model.opacity,
-            shs=gaussian_model.features,
+            shs=shs,
             scales=gaussian_model.scaling,
             rotations=nn.functional.normalize(gaussian_model.rotation, dim=-1),
-            colors_precomp=None,
+            colors_precomp=colors_precomp,
             cov3D_precomp=None,
         )
         color, radii = render_out[0], render_out[1]
@@ -249,7 +262,20 @@ def load_checkpoint(checkpoint_path: str, data_path: str | None = None, image_sc
     background_color = cfg.get("background_color")
     if background_color is None:
         background_color = [1.0, 1.0, 1.0] if cfg.get("white_background", False) else [0.0, 0.0, 0.0]
-    renderer = Render(scene.cameras, background_color=tuple(background_color))
+
+    # Restore lighting probes if present in checkpoint
+    probes = None
+    probe_payload = checkpoint.get("probes")
+    if probe_payload is not None:
+        import torch as _torch
+        from lighting_probes import LightingProbes
+        dummy_aabb = _torch.zeros(2, 3)
+        probes = LightingProbes(dummy_aabb, grid_size=int(probe_payload["grid_size"]),
+                                cubemap_res=int(probe_payload["cubemap_res"]),
+                                k_nearest=int(probe_payload["k_nearest"])).to(device)
+        probes.restore(probe_payload)
+
+    renderer = Render(scene.cameras, background_color=tuple(background_color), probes=probes)
     return checkpoint, scene, model, renderer
 
 

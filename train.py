@@ -11,6 +11,7 @@ from torch.autograd import Variable
 
 from colmap_reader import read_colmap_scene_info
 from gs_model import GaussianModel
+from lighting_probes import LightingProbes, build_probes_from_scene
 from render import Render, save_panel, split_indices
 
 try:
@@ -75,6 +76,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clone-jitter", type=float, default=0.35)
     parser.add_argument("--opacity-reset-interval", type=int, default=3000)
     parser.add_argument("--opacity-reset-max", type=float, default=0.01)
+
+    # Lighting probes
+    parser.add_argument("--probe-grid-size", type=int, default=3, help="Probes per axis (total = N^3)")
+    parser.add_argument("--probe-cubemap-res", type=int, default=8, help="Cubemap face resolution")
+    parser.add_argument("--probe-lr", type=float, default=1e-3, help="Learning rate for probe cubemaps")
+    parser.add_argument("--probe-k-nearest", type=int, default=4, help="Probes to blend per Gaussian")
+    parser.add_argument("--no-probes", action="store_true", help="Disable lighting probes")
 
     # W&B
     parser.add_argument("--wandb-project", type=str, default="gaussian-splatting", help="W&B project name")
@@ -158,17 +166,18 @@ def evaluate(renderer: Render, model: GaussianModel, camera_ids: list[int], max_
     return stats
 
 
-def save_checkpoint(path: Path, model: GaussianModel, args: argparse.Namespace, iteration: int) -> None:
+def save_checkpoint(path: Path, model: GaussianModel, args: argparse.Namespace, iteration: int, probes=None) -> None:
     payload = {
         "iteration": iteration,
         "config": vars(args),
         "model": model.capture(),
+        "probes": probes.capture() if probes is not None else None,
     }
     torch.save(payload, path)
 
 
-def rebuild_optimizer(model: GaussianModel, args: argparse.Namespace) -> tuple:
-    return model.training_setup(args)
+def rebuild_optimizer(model: GaussianModel, args: argparse.Namespace, probes=None) -> tuple:
+    return model.training_setup(args, probes=probes)
 
 
 def update_xyz_lr(optimizer: torch.optim.Optimizer, xyz_scheduler, iteration: int) -> None:
@@ -218,8 +227,21 @@ def main() -> None:
         max_points=args.max_points,
         seed=args.seed,
     ).to(args.device)
-    renderer = Render(scene.cameras, background_color=background)
-    optimizer, xyz_scheduler = rebuild_optimizer(model, args)
+
+    # Lighting probes
+    probes = None
+    if not args.no_probes:
+        points = torch.as_tensor(scene.point_cloud.points, dtype=torch.float32)
+        probes = build_probes_from_scene(
+            points,
+            grid_size=args.probe_grid_size,
+            cubemap_res=args.probe_cubemap_res,
+            k_nearest=args.probe_k_nearest,
+        ).to(args.device)
+        print(f"Lighting probes: {probes.num_probes} probes ({args.probe_grid_size}^3), cubemap {args.probe_cubemap_res}x{args.probe_cubemap_res}")
+
+    renderer = Render(scene.cameras, background_color=background, probes=probes)
+    optimizer, xyz_scheduler = rebuild_optimizer(model, args, probes=probes)
     scene_extent = float(scene.nerf_normalization["radius"])
 
     train_ids, val_ids = split_indices(len(scene.cameras), args.holdout_every)
@@ -296,7 +318,7 @@ def main() -> None:
             )
             structure_changed = density_log["changed"]
             if structure_changed:
-                optimizer, xyz_scheduler = rebuild_optimizer(model, args)
+                optimizer, xyz_scheduler = rebuild_optimizer(model, args, probes=probes)
 
         if (
             args.opacity_reset_interval > 0
@@ -304,7 +326,7 @@ def main() -> None:
             and iteration <= args.densify_until
         ):
             model.reset_opacity(args.opacity_reset_max)
-            optimizer, xyz_scheduler = rebuild_optimizer(model, args)
+            optimizer, xyz_scheduler = rebuild_optimizer(model, args, probes=probes)
             structure_changed = True
             opacity_reset_done = True
 
@@ -342,6 +364,8 @@ def main() -> None:
                     "lr/scaling": _get_lr(optimizer, "scaling"),
                     "lr/rotation": _get_lr(optimizer, "rotation"),
                 }
+                if probes is not None:
+                    wb_log["lr/probes"] = _get_lr(optimizer, "probes")
                 if density_log is not None:
                     wb_log.update({
                         "densify/cloned": density_log["cloned"],
@@ -376,7 +400,7 @@ def main() -> None:
             )
             if val_stats["psnr"] > best_val_psnr:
                 best_val_psnr = val_stats["psnr"]
-                save_checkpoint(checkpoint_dir / "best.pt", model, args, iteration)
+                save_checkpoint(checkpoint_dir / "best.pt", model, args, iteration, probes=probes)
 
             if use_wandb:
                 wandb.log(
@@ -392,8 +416,8 @@ def main() -> None:
                 )
 
         if iteration % args.save_every == 0 or iteration == args.iterations:
-            save_checkpoint(checkpoint_dir / f"iter_{iteration:05d}.pt", model, args, iteration)
-            save_checkpoint(checkpoint_dir / "latest.pt", model, args, iteration)
+            save_checkpoint(checkpoint_dir / f"iter_{iteration:05d}.pt", model, args, iteration, probes=probes)
+            save_checkpoint(checkpoint_dir / "latest.pt", model, args, iteration, probes=probes)
 
     if use_wandb:
         wandb.finish()
